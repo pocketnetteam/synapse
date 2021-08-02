@@ -220,8 +220,6 @@ class ProfileHandler(BaseHandler):
                 target_user.to_string(), profile
             )
 
-        await self._update_join_states(requester, target_user)
-
     async def get_avatar_url(self, target_user: UserID) -> Optional[str]:
         if self.hs.is_mine(target_user):
             try:
