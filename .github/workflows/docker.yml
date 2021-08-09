@@ -58,7 +58,7 @@ jobs:
         with:
           push: true
           labels: "gitsha1=${{ github.sha }}"
-          tags: "${{ secrets.DOCKERHUB_USERNAME }}/synapse:${{ steps.set-tag.outputs.tag }}"
+          tags: "${{ secrets.DOCKERHUB_USERNAME }}/matrix-synapse:${{ steps.set-tag.outputs.tag }}"
           file: "docker/Dockerfile"
           platforms: linux/amd64
 
@@ -67,6 +67,6 @@ jobs:
         with:
           push: true
           labels: "gitsha1=${{ github.sha }}"
-          tags: "${{ secrets.DOCKERHUB_USERNAME }}/synapse:${{ steps.set-tag.outputs.tag }}"
+          tags: "${{ secrets.DOCKERHUB_USERNAME }}/matrix-synapse:${{ steps.set-tag.outputs.tag }}"
           file: "docker/Dockerfile"
           platforms: linux/amd64,linux/arm64
