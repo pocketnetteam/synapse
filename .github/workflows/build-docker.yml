@@ -25,6 +25,6 @@ jobs:
           push: true
           context: ./
           file: ./docker/Dockerfile
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/matrix-sygnal:latest
-          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/matrix-sygnal:latest
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/matrix-synapse:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/matrix-synapse:latest
           cache-to: type=inline
