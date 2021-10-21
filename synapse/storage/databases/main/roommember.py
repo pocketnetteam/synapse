@@ -81,8 +81,8 @@ class RoomMemberWorkerStore(EventsWorkerStore):
         txn.close()
 
         if (
-            self.hs.config.run_background_tasks
-            and self.hs.config.metrics_flags.known_servers
+            self.hs.config.worker.run_background_tasks
+            and self.hs.config.metrics.metrics_flags.known_servers
         ):
             self._known_servers_count = 1
             self.hs.get_clock().looping_call(
@@ -162,7 +162,7 @@ class RoomMemberWorkerStore(EventsWorkerStore):
                 self._check_safe_current_state_events_membership_updated_txn,
             )
 
-    @cached(max_entries=100000, iterable=True)
+    @cached(max_entries=100000, iterable=True, prune_unread_entries=False)
     async def get_users_in_room(self, room_id: str) -> List[str]:
         return await self.db_pool.runInteraction(
             "get_users_in_room", self.get_users_in_room_txn, room_id
@@ -195,6 +195,11 @@ class RoomMemberWorkerStore(EventsWorkerStore):
         self, room_id: str
     ) -> Dict[str, ProfileInfo]:
         """Get a mapping from user ID to profile information for all users in a given room.
+
+        The profile information comes directly from this room's `m.room.member`
+        events, and so may be specific to this room rather than part of a user's
+        global profile. To avoid privacy leaks, the profile data should only be
+        revealed to users who are already in this room.
 
         Args:
             room_id: The ID of the room to retrieve the users of.
@@ -307,7 +312,9 @@ class RoomMemberWorkerStore(EventsWorkerStore):
         )
 
     @cached()
-    async def get_invited_rooms_for_local_user(self, user_id: str) -> RoomsForUser:
+    async def get_invited_rooms_for_local_user(
+        self, user_id: str
+    ) -> List[RoomsForUser]:
         """Get all the rooms the *local* user is invited to.
 
         Args:
@@ -384,9 +391,10 @@ class RoomMemberWorkerStore(EventsWorkerStore):
         )
 
         sql = """
-            SELECT room_id, e.sender, c.membership, event_id, e.stream_ordering
+            SELECT room_id, e.sender, c.membership, event_id, e.stream_ordering, r.room_version
             FROM local_current_membership AS c
             INNER JOIN events AS e USING (room_id, event_id)
+            INNER JOIN rooms AS r USING (room_id)
             WHERE
                 user_id = ?
                 AND %s
@@ -395,7 +403,7 @@ class RoomMemberWorkerStore(EventsWorkerStore):
         )
 
         txn.execute(sql, (user_id, *args))
-        results = [RoomsForUser(**r) for r in self.db_pool.cursor_to_dict(txn)]
+        results = [RoomsForUser(*r) for r in txn]
 
         return results
 
@@ -431,7 +439,7 @@ class RoomMemberWorkerStore(EventsWorkerStore):
 
         return results_dict.get("membership"), results_dict.get("event_id")
 
-    @cached(max_entries=500000, iterable=True)
+    @cached(max_entries=500000, iterable=True, prune_unread_entries=False)
     async def get_rooms_for_user_with_stream_ordering(
         self, user_id: str
     ) -> FrozenSet[GetRoomsForUserWithStreamOrdering]:
@@ -445,7 +453,8 @@ class RoomMemberWorkerStore(EventsWorkerStore):
 
         Returns:
             Returns the rooms the user is in currently, along with the stream
-            ordering of the most recent join for that user and room.
+            ordering of the most recent join for that user and room, along with
+            the room version of the room.
         """
         return await self.db_pool.runInteraction(
             "get_rooms_for_user_with_stream_ordering",
@@ -522,7 +531,9 @@ class RoomMemberWorkerStore(EventsWorkerStore):
             _get_users_server_still_shares_room_with_txn,
         )
 
-    async def get_rooms_for_user(self, user_id: str, on_invalidate=None):
+    async def get_rooms_for_user(
+        self, user_id: str, on_invalidate=None
+    ) -> FrozenSet[str]:
         """Returns a set of room_ids the user is currently joined to.
 
         If a remote user only returns rooms this server is currently
@@ -533,7 +544,12 @@ class RoomMemberWorkerStore(EventsWorkerStore):
         )
         return frozenset(r.room_id for r in rooms)
 
-    @cached(max_entries=500000, cache_context=True, iterable=True)
+    @cached(
+        max_entries=500000,
+        cache_context=True,
+        iterable=True,
+        prune_unread_entries=False,
+    )
     async def get_users_who_share_room_with_user(
         self, user_id: str, cache_context: _CacheContext
     ) -> Set[str]:

@@ -23,6 +23,7 @@ from synapse.metrics.background_process_metrics import (
     wrap_as_background_process,
 )
 from synapse.replication.tcp.streams import TypingStream
+from synapse.streams import EventSource
 from synapse.types import JsonDict, Requester, UserID, get_domain_from_id
 from synapse.util.caches.stream_change_cache import StreamChangeCache
 from synapse.util.metrics import Measure
@@ -53,7 +54,7 @@ class FollowerTypingHandler:
 
     def __init__(self, hs: "HomeServer"):
         self.store = hs.get_datastore()
-        self.server_name = hs.config.server_name
+        self.server_name = hs.config.server.server_name
         self.clock = hs.get_clock()
         self.is_mine_id = hs.is_mine_id
 
@@ -73,7 +74,7 @@ class FollowerTypingHandler:
         self._room_typing: Dict[str, Set[str]] = {}
 
         self._member_last_federation_poke: Dict[RoomMember, int] = {}
-        self.wheel_timer = WheelTimer(bucket_size=5000)
+        self.wheel_timer: WheelTimer[RoomMember] = WheelTimer(bucket_size=5000)
         self._latest_room_serial = 0
 
         self.clock.looping_call(self._handle_timeouts, 5000)
@@ -439,7 +440,7 @@ class TypingWriterHandler(FollowerTypingHandler):
         raise Exception("Typing writer instance got typing info over replication")
 
 
-class TypingNotificationEventSource:
+class TypingNotificationEventSource(EventSource[int, JsonDict]):
     def __init__(self, hs: "HomeServer"):
         self.hs = hs
         self.clock = hs.get_clock()
@@ -482,10 +483,16 @@ class TypingNotificationEventSource:
 
                 events.append(self._make_event_for(room_id))
 
-            return (events, handler._latest_room_serial)
+            return events, handler._latest_room_serial
 
     async def get_new_events(
-        self, from_key: int, room_ids: Iterable[str], **kwargs
+        self,
+        user: UserID,
+        from_key: int,
+        limit: Optional[int],
+        room_ids: Iterable[str],
+        is_guest: bool,
+        explicit_room_id: Optional[str] = None,
     ) -> Tuple[List[JsonDict], int]:
         with Measure(self.clock, "typing.get_new_events"):
             from_key = int(from_key)
@@ -500,7 +507,7 @@ class TypingNotificationEventSource:
 
                 events.append(self._make_event_for(room_id))
 
-            return (events, handler._latest_room_serial)
+            return events, handler._latest_room_serial
 
     def get_current_key(self) -> int:
         return self.get_typing_handler()._latest_room_serial

@@ -24,14 +24,17 @@ from typing import (
     List,
     Optional,
     Tuple,
+    Union,
 )
 
+import attr
 import jinja2
 
 from twisted.internet import defer
 from twisted.web.resource import IResource
 
 from synapse.events import EventBase
+from synapse.events.presence_router import PresenceRouter
 from synapse.http.client import SimpleHttpClient
 from synapse.http.server import (
     DirectServeHtmlResource,
@@ -42,10 +45,18 @@ from synapse.http.servlet import parse_json_object_from_request
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.rest.client.login import LoginResponse
 from synapse.storage.database import DatabasePool, LoggingTransaction
 from synapse.storage.databases.main.roommember import ProfileInfo
 from synapse.storage.state import StateFilter
-from synapse.types import JsonDict, Requester, UserID, UserInfo, create_requester
+from synapse.types import (
+    DomainSpecificString,
+    JsonDict,
+    Requester,
+    UserID,
+    UserInfo,
+    create_requester,
+)
 from synapse.util import Clock
 from synapse.util.caches.descriptors import cached
 
@@ -56,6 +67,8 @@ if TYPE_CHECKING:
 This package defines the 'stable' API which can be used by extension modules which
 are loaded into Synapse.
 """
+
+PRESENCE_ALL_USERS = PresenceRouter.ALL_USERS
 
 __all__ = [
     "errors",
@@ -70,9 +83,24 @@ __all__ = [
     "DirectServeHtmlResource",
     "DirectServeJsonResource",
     "ModuleApi",
+    "PRESENCE_ALL_USERS",
+    "LoginResponse",
+    "JsonDict",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+@attr.s(auto_attribs=True)
+class UserIpAndAgent:
+    """
+    An IP address and user agent used by a user to connect to this homeserver.
+    """
+
+    ip: str
+    user_agent: str
+    # The time at which this user agent/ip was last seen.
+    last_seen: int
 
 
 class ModuleApi:
@@ -87,20 +115,23 @@ class ModuleApi:
         self._auth = hs.get_auth()
         self._auth_handler = auth_handler
         self._server_name = hs.hostname
-        self._presence_stream = hs.get_event_sources().sources["presence"]
+        self._presence_stream = hs.get_event_sources().sources.presence
         self._state = hs.get_state_handler()
         self._clock: Clock = hs.get_clock()
         self._send_email_handler = hs.get_send_email_handler()
+        self.custom_template_dir = hs.config.server.custom_template_directory
 
         try:
-            app_name = self._hs.config.email_app_name
+            app_name = self._hs.config.email.email_app_name
 
-            self._from_string = self._hs.config.email_notif_from % {"app": app_name}
+            self._from_string = self._hs.config.email.email_notif_from % {
+                "app": app_name
+            }
         except (KeyError, TypeError):
             # If substitution failed (which can happen if the string contains
             # placeholders other than just "app", or if the type of the placeholder is
             # not a string), fall back to the bare strings.
-            self._from_string = self._hs.config.email_notif_from
+            self._from_string = self._hs.config.email.email_notif_from
 
         self._raw_from = email.utils.parseaddr(self._from_string)[1]
 
@@ -111,6 +142,8 @@ class ModuleApi:
         self._spam_checker = hs.get_spam_checker()
         self._account_validity_handler = hs.get_account_validity_handler()
         self._third_party_event_rules = hs.get_third_party_event_rules()
+        self._password_auth_provider = hs.get_password_auth_provider()
+        self._presence_router = hs.get_presence_router()
 
     #################################################################################
     # The following methods should only be called during the module's initialisation.
@@ -129,6 +162,16 @@ class ModuleApi:
     def register_third_party_rules_callbacks(self):
         """Registers callbacks for third party event rules capabilities."""
         return self._third_party_event_rules.register_third_party_rules_callbacks
+
+    @property
+    def register_presence_router_callbacks(self):
+        """Registers callbacks for presence router capabilities."""
+        return self._presence_router.register_presence_router_callbacks
+
+    @property
+    def register_password_auth_provider_callbacks(self):
+        """Registers callbacks for password auth provider capabilities."""
+        return self._password_auth_provider.register_password_auth_provider_callbacks
 
     def register_web_resource(self, path: str, resource: IResource):
         """Registers a web resource to be served at the given path.
@@ -167,7 +210,7 @@ class ModuleApi:
     @property
     def public_baseurl(self) -> str:
         """The configured public base URL for this homeserver."""
-        return self._hs.config.public_baseurl
+        return self._hs.config.server.public_baseurl
 
     @property
     def email_app_name(self) -> str:
@@ -603,9 +646,14 @@ class ModuleApi:
         msec: float,
         *args,
         desc: Optional[str] = None,
+        run_on_all_instances: bool = False,
         **kwargs,
     ):
         """Wraps a function as a background process and calls it repeatedly.
+
+        NOTE: Will only run on the instance that is configured to run
+        background processes (which is the main process by default), unless
+        `run_on_all_workers` is set.
 
         Waits `msec` initially before calling `f` for the first time.
 
@@ -617,12 +665,14 @@ class ModuleApi:
             msec: How long to wait between calls in milliseconds.
             *args: Positional arguments to pass to function.
             desc: The background task's description. Default to the function's name.
+            run_on_all_instances: Whether to run this on all instances, rather
+                than just the instance configured to run background tasks.
             **kwargs: Key arguments to pass to function.
         """
         if desc is None:
             desc = f.__name__
 
-        if self._hs.config.run_background_tasks:
+        if self._hs.config.worker.run_background_tasks or run_on_all_instances:
             self._clock.looping_call(
                 run_as_background_process,
                 msec,
@@ -677,7 +727,69 @@ class ModuleApi:
             A list containing the loaded templates, with the orders matching the one of
             the filenames parameter.
         """
-        return self._hs.config.read_templates(filenames, custom_template_directory)
+        return self._hs.config.read_templates(
+            filenames,
+            (td for td in (self.custom_template_dir, custom_template_directory) if td),
+        )
+
+    def is_mine(self, id: Union[str, DomainSpecificString]) -> bool:
+        """
+        Checks whether an ID (user id, room, ...) comes from this homeserver.
+
+        Args:
+            id: any Matrix id (e.g. user id, room id, ...), either as a raw id,
+                e.g. string "@user:example.com" or as a parsed UserID, RoomID, ...
+        Returns:
+            True if id comes from this homeserver, False otherwise.
+
+        Added in Synapse v1.44.0.
+        """
+        if isinstance(id, DomainSpecificString):
+            return self._hs.is_mine(id)
+        else:
+            return self._hs.is_mine_id(id)
+
+    async def get_user_ip_and_agents(
+        self, user_id: str, since_ts: int = 0
+    ) -> List[UserIpAndAgent]:
+        """
+        Return the list of user IPs and agents for a user.
+
+        Args:
+            user_id: the id of a user, local or remote
+            since_ts: a timestamp in seconds since the epoch,
+                or the epoch itself if not specified.
+        Returns:
+            The list of all UserIpAndAgent that the user has
+            used to connect to this homeserver since `since_ts`.
+            If the user is remote, this list is empty.
+
+        Added in Synapse v1.44.0.
+        """
+        # Don't hit the db if this is not a local user.
+        is_mine = False
+        try:
+            # Let's be defensive against ill-formed strings.
+            if self.is_mine(user_id):
+                is_mine = True
+        except Exception:
+            pass
+
+        if is_mine:
+            raw_data = await self._store.get_user_ip_and_agents(
+                UserID.from_string(user_id), since_ts
+            )
+            # Sanitize some of the data. We don't want to return tokens.
+            return [
+                UserIpAndAgent(
+                    ip=data["ip"],
+                    user_agent=data["user_agent"],
+                    last_seen=data["last_seen"],
+                )
+                for data in raw_data
+            ]
+        else:
+            return []
 
 
 class PublicRoomListManager:

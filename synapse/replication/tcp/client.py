@@ -73,7 +73,7 @@ class DirectTcpReplicationClientFactory(ReconnectingClientFactory):
     ):
         self.client_name = client_name
         self.command_handler = command_handler
-        self.server_name = hs.config.server_name
+        self.server_name = hs.config.server.server_name
         self.hs = hs
         self._clock = hs.get_clock()  # As self.clock is defined in super class
 
@@ -117,7 +117,7 @@ class ReplicationDataHandler:
         self._instance_name = hs.get_instance_name()
         self._typing_handler = hs.get_typing_handler()
 
-        self._notify_pushers = hs.config.start_pushers
+        self._notify_pushers = hs.config.worker.start_pushers
         self._pusher_pool = hs.get_pusherpool()
         self._presence_handler = hs.get_presence_handler()
 

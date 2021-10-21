@@ -280,18 +280,18 @@ class LoggingTransaction:
         else:
             self.executemany(sql, args)
 
-    def execute_values(self, sql: str, *args: Any) -> List[Tuple]:
+    def execute_values(self, sql: str, *args: Any, fetch: bool = True) -> List[Tuple]:
         """Corresponds to psycopg2.extras.execute_values. Only available when
         using postgres.
 
-        Always sets fetch=True when caling `execute_values`, so will return the
-        results.
+        The `fetch` parameter must be set to False if the query does not return
+        rows (e.g. INSERTs).
         """
         assert isinstance(self.database_engine, PostgresEngine)
         from psycopg2.extras import execute_values  # type: ignore
 
         return self._do_execute(
-            lambda *x: execute_values(self.txn, *x, fetch=True), sql, *args
+            lambda *x: execute_values(self.txn, *x, fetch=fetch), sql, *args
         )
 
     def execute(self, sql: str, *args: Any) -> None:
@@ -920,13 +920,23 @@ class DatabasePool:
             if k != keys[0]:
                 raise RuntimeError("All items must have the same keys")
 
-        sql = "INSERT INTO %s (%s) VALUES(%s)" % (
-            table,
-            ", ".join(k for k in keys[0]),
-            ", ".join("?" for _ in keys[0]),
-        )
+        if isinstance(txn.database_engine, PostgresEngine):
+            # We use `execute_values` as it can be a lot faster than `execute_batch`,
+            # but it's only available on postgres.
+            sql = "INSERT INTO %s (%s) VALUES ?" % (
+                table,
+                ", ".join(k for k in keys[0]),
+            )
 
-        txn.execute_batch(sql, vals)
+            txn.execute_values(sql, vals, fetch=False)
+        else:
+            sql = "INSERT INTO %s (%s) VALUES(%s)" % (
+                table,
+                ", ".join(k for k in keys[0]),
+                ", ".join("?" for _ in keys[0]),
+            )
+
+            txn.execute_batch(sql, vals)
 
     async def simple_upsert(
         self,
@@ -1281,20 +1291,33 @@ class DatabasePool:
                 k + "=EXCLUDED." + k for k in value_names
             )
 
-        sql = "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO %s" % (
-            table,
-            ", ".join(k for k in allnames),
-            ", ".join("?" for _ in allnames),
-            ", ".join(key_names),
-            latter,
-        )
-
         args = []
 
         for x, y in zip(key_values, value_values):
             args.append(tuple(x) + tuple(y))
 
-        return txn.execute_batch(sql, args)
+        if isinstance(txn.database_engine, PostgresEngine):
+            # We use `execute_values` as it can be a lot faster than `execute_batch`,
+            # but it's only available on postgres.
+            sql = "INSERT INTO %s (%s) VALUES ? ON CONFLICT (%s) DO %s" % (
+                table,
+                ", ".join(k for k in allnames),
+                ", ".join(key_names),
+                latter,
+            )
+
+            txn.execute_values(sql, args, fetch=False)
+
+        else:
+            sql = "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO %s" % (
+                table,
+                ", ".join(k for k in allnames),
+                ", ".join("?" for _ in allnames),
+                ", ".join(key_names),
+                latter,
+            )
+
+            return txn.execute_batch(sql, args)
 
     @overload
     async def simple_select_one(
@@ -1609,7 +1632,7 @@ class DatabasePool:
         txn: LoggingTransaction,
         table: str,
         column: str,
-        iterable: Iterable[Any],
+        iterable: Collection[Any],
         keyvalues: Dict[str, Any],
         retcols: Iterable[str],
     ) -> List[Dict[str, Any]]:
@@ -1868,29 +1891,32 @@ class DatabasePool:
         txn: LoggingTransaction,
         table: str,
         column: str,
-        iterable: Iterable[Any],
+        values: Collection[Any],
         keyvalues: Dict[str, Any],
     ) -> int:
         """Executes a DELETE query on the named table.
 
-        Filters rows by if value of `column` is in `iterable`.
+        Deletes the rows:
+          - whose value of `column` is in `values`; AND
+          - that match extra column-value pairs specified in `keyvalues`.
 
         Args:
             txn: Transaction object
             table: string giving the table name
-            column: column name to test for inclusion against `iterable`
-            iterable: list
-            keyvalues: dict of column names and values to select the rows with
+            column: column name to test for inclusion against `values`
+            values: values of `column` which choose rows to delete
+            keyvalues: dict of extra column names and values to select the rows
+                with. They will be ANDed together with the main predicate.
 
         Returns:
             Number rows deleted
         """
-        if not iterable:
+        if not values:
             return 0
 
         sql = "DELETE FROM %s" % table
 
-        clause, values = make_in_list_sql_clause(txn.database_engine, column, iterable)
+        clause, values = make_in_list_sql_clause(txn.database_engine, column, values)
         clauses = [clause]
 
         for key, value in keyvalues.items():
@@ -2075,7 +2101,7 @@ class DatabasePool:
 
 
 def make_in_list_sql_clause(
-    database_engine: BaseDatabaseEngine, column: str, iterable: Iterable
+    database_engine: BaseDatabaseEngine, column: str, iterable: Collection[Any]
 ) -> Tuple[str, list]:
     """Returns an SQL clause that checks the given column is in the iterable.
 
