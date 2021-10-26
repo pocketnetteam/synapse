@@ -225,7 +225,8 @@ server admin: <a href="../usage/administration/admin_api">Admin API</a></p>
             &quot;auth_provider&quot;: &quot;&lt;provider2&gt;&quot;,
             &quot;external_id&quot;: &quot;&lt;user_id_provider_2&gt;&quot;
         }
-    ]
+    ],
+    &quot;user_type&quot;: null
 }
 </code></pre>
 <p>URL parameters:</p>
@@ -264,7 +265,8 @@ specific <code>user_id</code>.</p>
     ],
     &quot;avatar_url&quot;: &quot;&lt;avatar_url&gt;&quot;,
     &quot;admin&quot;: false,
-    &quot;deactivated&quot;: false
+    &quot;deactivated&quot;: false,
+    &quot;user_type&quot;: null
 }
 </code></pre>
 <p>To use it, you will need to authenticate by providing an <code>access_token</code> for a
@@ -307,6 +309,9 @@ in homeserver configuration.</li>
 unchanged on existing accounts and set to <code>false</code> for new accounts.
 A user cannot be erased by deactivating with this API. For details on
 deactivating users see <a href="#deactivate-account">Deactivate Account</a>.</li>
+<li><code>user_type</code> - string or null, optional. If provided, the user type will be
+adjusted. If <code>null</code> given, the user type will be cleared. Other 
+allowed options are: <code>bot</code> and <code>support</code>.</li>
 </ul>
 <p>If the user already exists then optional parameters default to the current value.</p>
 <p>In order to re-activate an account <code>deactivated</code> must be set to <code>false</code>. If
@@ -494,6 +499,7 @@ An empty body may be passed for backwards compatibility.</p>
 <li>Remove all 3PIDs from the homeserver</li>
 <li>Delete all devices and E2EE keys</li>
 <li>Delete all access tokens</li>
+<li>Delete all pushers</li>
 <li>Delete the password hash</li>
 <li>Removal from all rooms the user is a member of</li>
 <li>Remove the user from the user directory</li>
@@ -506,6 +512,16 @@ is set to <code>true</code>:</p>
 <li>Remove the user's display name</li>
 <li>Remove the user's avatar URL</li>
 <li>Mark the user as erased</li>
+</ul>
+<p>The following actions are <strong>NOT</strong> performed. The list may be incomplete.</p>
+<ul>
+<li>Remove mappings of SSO IDs</li>
+<li><a href="#delete-media-uploaded-by-a-user">Delete media uploaded</a> by user (included avatar images)</li>
+<li>Delete sent and received messages</li>
+<li>Delete E2E cross-signing keys</li>
+<li>Remove the user's creation (registration) timestamp</li>
+<li><a href="#override-ratelimiting-for-users">Remove rate limit overrides</a></li>
+<li>Remove from monthly active users</li>
 </ul>
 <h2 id="reset-password"><a class="header" href="#reset-password">Reset password</a></h2>
 <p>Changes the password of another user. This will automatically log the user out of all their devices.</p>
