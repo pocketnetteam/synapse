@@ -20,6 +20,9 @@ from synapse.api.constants import (
     HistoryVisibility,
     Membership,
 )
+from synapse.api.errors import (
+    AuthError,
+)
 from synapse.events import EventBase
 from synapse.events.utils import prune_event
 from synapse.storage import Storage
@@ -163,6 +166,11 @@ async def filter_events_for_client(
                 "history_visibility", HistoryVisibility.SHARED
             )
         else:
+            raise AuthError(
+                403,
+                "visibility_event was not found %s"
+                % state
+            )
             visibility = HistoryVisibility.SHARED
 
         if visibility not in VISIBILITY_PRIORITY:
@@ -240,6 +248,11 @@ async def filter_events_for_client(
             # ideally we would share history up to the point they left. But
             # we don't know when they left. We just treat it as though they
             # never joined, and restrict access.
+            raise AuthError(
+                403,
+                "visibility is shared was not found %s"
+                % state
+            )
             return None
 
         # the visibility is either shared or world_readable, and the user was
