@@ -166,11 +166,6 @@ async def filter_events_for_client(
                 "history_visibility", HistoryVisibility.SHARED
             )
         else:
-            raise AuthError(
-                403,
-                "visibility_event was not found %s"
-                % state
-            )
             visibility = HistoryVisibility.SHARED
 
         if visibility not in VISIBILITY_PRIORITY:
@@ -224,7 +219,7 @@ async def filter_events_for_client(
 
         # if the user was a member of the room at the time of the event,
         # they can see it.
-        if membership == Membership.JOIN:
+        if membership == Membership.JOIN or membership == Membership.INVITE:
             return event
 
         # otherwise, it depends on the room visibility.
@@ -248,11 +243,6 @@ async def filter_events_for_client(
             # ideally we would share history up to the point they left. But
             # we don't know when they left. We just treat it as though they
             # never joined, and restrict access.
-            raise AuthError(
-                403,
-                "visibility is shared was not found %s"
-                % state
-            )
             return None
 
         # the visibility is either shared or world_readable, and the user was
