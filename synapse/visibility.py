@@ -20,11 +20,6 @@ from synapse.api.constants import (
     HistoryVisibility,
     Membership,
 )
-
-from synapse.api.errors import (
-    AuthError,
-)
-
 from synapse.events import EventBase
 from synapse.events.utils import prune_event
 from synapse.storage import Storage
@@ -134,10 +129,6 @@ async def filter_events_for_client(
                 return None
 
             if not event.is_state() and event.sender in ignore_list:
-                raise AuthError(
-                    403,
-                    "1, event in ignore list",
-                )
                 return None
 
             # Until MSC2261 has landed we can't redact malicious alias events, so for
@@ -158,10 +149,6 @@ async def filter_events_for_client(
                     oldest_allowed_ts = storage.main.clock.time_msec() - max_lifetime
 
                     if event.origin_server_ts < oldest_allowed_ts:
-                        raise AuthError(
-                            403,
-                            "2, max lifetime error",
-                        )
                         return None
 
         if event.event_id in always_include_ids:
@@ -237,21 +224,11 @@ async def filter_events_for_client(
         if visibility == HistoryVisibility.JOINED:
             # we weren't a member at the time of the event, so we can't
             # see this event.
-            raise AuthError(
-                403,
-                "3, visibility: %s membership: %s event: %s"
-                % (visibility, membership, event)
-            )
             return None
 
         elif visibility == HistoryVisibility.INVITED:
             # user can also see the event if they were *invited* at the time
             # of the event.
-            raise AuthError(
-                403,
-                "4, visibility: %s membership: %s event: %s"
-                % (visibility, membership, event)
-            )
             return event if membership == Membership.INVITE else None
 
         elif visibility == HistoryVisibility.SHARED and is_peeking:
@@ -263,11 +240,6 @@ async def filter_events_for_client(
             # ideally we would share history up to the point they left. But
             # we don't know when they left. We just treat it as though they
             # never joined, and restrict access.
-            raise AuthError(
-                403,
-                "5, visibility: %s membership: %s event: %s"
-                % (visibility, membership, event)
-            )
             return None
 
         # the visibility is either shared or world_readable, and the user was
