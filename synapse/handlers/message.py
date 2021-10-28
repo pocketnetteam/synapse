@@ -220,8 +220,8 @@ class MessageHandler:
             else:
                 raise AuthError(
                     403,
-                    "User %s not allowed to view events in room %s at token %s"
-                    % (user_id, room_id, at_token),
+                    "User %s not allowed to view events in room %s at token %s last events: %s"
+                    % (user_id, room_id, at_token, last_events),
                 )
         else:
             (
