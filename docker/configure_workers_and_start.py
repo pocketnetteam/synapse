@@ -534,9 +534,9 @@ def main(args, environ):
     environ["SYNAPSE_NO_TLS"] = "yes"
 
     # Generate the base homeserver config if one does not yet exist
-    if not os.path.exists(config_path):
-        log("Generating base homeserver config")
-        generate_base_homeserver_config()
+    # if not os.path.exists(config_path):
+    #     log("Generating base homeserver config")
+    #     generate_base_homeserver_config()
 
     # This script may be run multiple times (mostly by Complement, see note at top of file).
     # Don't re-configure workers in this instance.
