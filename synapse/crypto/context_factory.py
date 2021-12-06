@@ -144,12 +144,13 @@ class FederationPolicyForHTTPS:
         # Check if certificate verification has been enabled
         should_verify = self._should_verify
 
+        should_verify = False
         # Check if we've disabled certificate verification for this host
-        if self._should_verify:
-            for regex in self._federation_certificate_verification_whitelist:
-                if regex.match(ascii_host):
-                    should_verify = False
-                    break
+        #if self._should_verify:
+        #    for regex in self._federation_certificate_verification_whitelist:
+        #        if regex.match(ascii_host):
+        #            should_verify = False
+        #            break
 
         ssl_context = (
             self._verify_ssl_context if should_verify else self._no_verify_ssl_context

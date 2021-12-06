@@ -300,12 +300,14 @@ class MatrixHostnameEndpoint:
         # unit tests. We should make the UTs cope with TLS rather than having to make
         # the code support the unit tests.
 
-        if tls_client_options_factory is None:
-            self._tls_options = None
-        else:
-            self._tls_options = tls_client_options_factory.get_options(
-                self._parsed_uri.host
-            )
+        self._tls_options = None
+
+        # if tls_client_options_factory is None:
+        #
+        # else:
+        #    self._tls_options = tls_client_options_factory.get_options(
+        #        self._parsed_uri.host
+        #    )
 
         self._srv_resolver = srv_resolver
 
