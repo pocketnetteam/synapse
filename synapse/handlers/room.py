@@ -1151,7 +1151,7 @@ class RoomContextHandler:
 
         filtered = await filter_evts([event])
         if not filtered:
-            raise AuthError(403, "You don't have permission to access that event.")
+            raise AuthError(403, "You don't have permission to access that event. " + event_id)
 
         results = await self.store.get_events_around(
             room_id, event_id, before_limit, after_limit, event_filter

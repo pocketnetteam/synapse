@@ -171,6 +171,6 @@ class EventHandler:
         )
 
         if not filtered:
-            raise AuthError(403, "You don't have permission to access that event.")
+            raise AuthError(403, "You don't have permission to access that event.. " + event_id)
 
         return event
