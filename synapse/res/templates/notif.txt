@@ -13,6 +13,8 @@ An encrypted message.
 {{ message.body_text_plain }}
 {%- elif message.msgtype == "m.file" %}
 {{ message.body_text_plain }}
+{%- elif message.msgtype == "m.media" %}
+{{ message.body_text_plain }}
 {%- else %}
 A message with unrecognised content.
 {%- endif %}
