@@ -33,6 +33,8 @@
                         <img src="{{ message.image_url|mxc_to_http(640, 480, scale) }}" />
                     {%- elif message.msgtype == "m.file" %}
                         <span class="filename">{{ message.body_text_plain }}</span>
+                    {%- elif message.msgtype == "m.audio" %}
+                        {{ message.body_text_html }}
                     {%- else %}
                         A message with unrecognised content.
                     {%- endif %}
