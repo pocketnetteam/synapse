@@ -18,12 +18,11 @@ from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, U
 from urllib.parse import urlencode, urlparse
 
 import attr
-import pymacaroons
 from authlib.common.security import generate_token
 from authlib.jose import JsonWebToken, jwt
 from authlib.oauth2.auth import ClientAuth
 from authlib.oauth2.rfc6749.parameters import prepare_grant_uri
-from authlib.oidc.core import CodeIDToken, ImplicitIDToken, UserInfo
+from authlib.oidc.core import CodeIDToken, UserInfo
 from authlib.oidc.discovery import OpenIDProviderMetadata, get_well_known_url
 from jinja2 import Environment, Template
 from pymacaroons.exceptions import (
@@ -44,7 +43,8 @@ from synapse.logging.context import make_deferred_yieldable
 from synapse.types import JsonDict, UserID, map_username_to_mxid_localpart
 from synapse.util import Clock, json_decoder
 from synapse.util.caches.cached_call import RetryOnExceptionCachedCall
-from synapse.util.macaroons import get_value_from_macaroon, satisfy_expiry
+from synapse.util.macaroons import MacaroonGenerator, OidcSessionData
+from synapse.util.templates import _localpart_from_email_filter
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -104,9 +104,10 @@ class OidcHandler:
         # we should not have been instantiated if there is no configured provider.
         assert provider_confs
 
-        self._token_generator = OidcSessionTokenGenerator(hs)
+        self._macaroon_generator = hs.get_macaroon_generator()
         self._providers: Dict[str, "OidcProvider"] = {
-            p.idp_id: OidcProvider(hs, self._token_generator, p) for p in provider_confs
+            p.idp_id: OidcProvider(hs, self._macaroon_generator, p)
+            for p in provider_confs
         }
 
     async def load_metadata(self) -> None:
@@ -117,7 +118,8 @@ class OidcHandler:
         for idp_id, p in self._providers.items():
             try:
                 await p.load_metadata()
-                await p.load_jwks()
+                if not p._uses_userinfo:
+                    await p.load_jwks()
             except Exception as e:
                 raise Exception(
                     "Error while initialising OIDC provider %r" % (idp_id,)
@@ -214,7 +216,7 @@ class OidcHandler:
 
         # Deserialize the session token and verify it.
         try:
-            session_data = self._token_generator.verify_oidc_session_token(
+            session_data = self._macaroon_generator.verify_oidc_session_token(
                 session, state
             )
         except (MacaroonInitException, MacaroonDeserializationException, KeyError) as e:
@@ -222,7 +224,7 @@ class OidcHandler:
             self._sso_handler.render_error(request, "invalid_session", str(e))
             return
         except MacaroonInvalidSignatureException as e:
-            logger.exception("Could not verify session for OIDC callback")
+            logger.warning("Could not verify session for OIDC callback: %s", e)
             self._sso_handler.render_error(request, "mismatching_session", str(e))
             return
 
@@ -269,12 +271,12 @@ class OidcProvider:
     def __init__(
         self,
         hs: "HomeServer",
-        token_generator: "OidcSessionTokenGenerator",
+        macaroon_generator: MacaroonGenerator,
         provider: OidcProviderConfig,
     ):
-        self._store = hs.get_datastore()
+        self._store = hs.get_datastores().main
 
-        self._token_generator = token_generator
+        self._macaroon_generaton = macaroon_generator
 
         self._config = provider
         self._callback_url: str = hs.config.oidc.oidc_callback_url
@@ -498,10 +500,6 @@ class OidcProvider:
         return await self._jwks.get()
 
     async def _load_jwks(self) -> JWKS:
-        if self._uses_userinfo:
-            # We're not using jwt signing, return an empty jwk set
-            return {"keys": []}
-
         metadata = await self.load_metadata()
 
         # Load the JWKS using the `jwks_uri` metadata.
@@ -547,9 +545,9 @@ class OidcProvider:
         """
         metadata = await self.load_metadata()
         token_endpoint = metadata.get("token_endpoint")
-        raw_headers = {
+        raw_headers: Dict[str, str] = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": self._http_client.user_agent,
+            "User-Agent": self._http_client.user_agent.decode("ascii"),
             "Accept": "application/json",
         }
 
@@ -663,7 +661,7 @@ class OidcProvider:
 
         return UserInfo(resp)
 
-    async def _parse_id_token(self, token: Token, nonce: str) -> UserInfo:
+    async def _parse_id_token(self, token: Token, nonce: str) -> CodeIDToken:
         """Return an instance of UserInfo from token's ``id_token``.
 
         Args:
@@ -673,7 +671,7 @@ class OidcProvider:
                 request. This value should match the one inside the token.
 
         Returns:
-            An object representing the user.
+            The decoded claims in the ID token.
         """
         metadata = await self.load_metadata()
         claims_params = {
@@ -684,9 +682,6 @@ class OidcProvider:
             # If we got an `access_token`, there should be an `at_hash` claim
             # in the `id_token` that we can check against.
             claims_params["access_token"] = token["access_token"]
-            claims_cls = CodeIDToken
-        else:
-            claims_cls = ImplicitIDToken
 
         alg_values = metadata.get("id_token_signing_alg_values_supported", ["RS256"])
         jwt = JsonWebToken(alg_values)
@@ -703,7 +698,7 @@ class OidcProvider:
             claims = jwt.decode(
                 id_token,
                 key=jwk_set,
-                claims_cls=claims_cls,
+                claims_cls=CodeIDToken,
                 claims_options=claim_options,
                 claims_params=claims_params,
             )
@@ -713,7 +708,7 @@ class OidcProvider:
             claims = jwt.decode(
                 id_token,
                 key=jwk_set,
-                claims_cls=claims_cls,
+                claims_cls=CodeIDToken,
                 claims_options=claim_options,
                 claims_params=claims_params,
             )
@@ -721,7 +716,8 @@ class OidcProvider:
         logger.debug("Decoded id_token JWT %r; validating", claims)
 
         claims.validate(leeway=120)  # allows 2 min of clock skew
-        return UserInfo(claims)
+
+        return claims
 
     async def handle_redirect_request(
         self,
@@ -765,7 +761,7 @@ class OidcProvider:
         if not client_redirect_url:
             client_redirect_url = b""
 
-        cookie = self._token_generator.generate_oidc_session_token(
+        cookie = self._macaroon_generaton.generate_oidc_session_token(
             state=state,
             session_data=OidcSessionData(
                 idp_id=self.idp_id,
@@ -831,14 +827,28 @@ class OidcProvider:
             logger.debug("Exchanging OAuth2 code for a token")
             token = await self._exchange_code(code)
         except OidcError as e:
-            logger.exception("Could not exchange OAuth2 code")
+            logger.warning("Could not exchange OAuth2 code: %s", e)
             self._sso_handler.render_error(request, e.error, e.error_description)
             return
 
         logger.debug("Successfully obtained OAuth2 token data: %r", token)
 
-        # Now that we have a token, get the userinfo, either by decoding the
-        # `id_token` or by fetching the `userinfo_endpoint`.
+        # If there is an id_token, it should be validated, regardless of the
+        # userinfo endpoint is used or not.
+        if token.get("id_token") is not None:
+            try:
+                id_token = await self._parse_id_token(token, nonce=session_data.nonce)
+                sid = id_token.get("sid")
+            except Exception as e:
+                logger.exception("Invalid id_token")
+                self._sso_handler.render_error(request, "invalid_token", str(e))
+                return
+        else:
+            id_token = None
+            sid = None
+
+        # Now that we have a token, get the userinfo either from the `id_token`
+        # claims or by fetching the `userinfo_endpoint`.
         if self._uses_userinfo:
             try:
                 userinfo = await self._fetch_userinfo(token)
@@ -846,13 +856,14 @@ class OidcProvider:
                 logger.exception("Could not fetch userinfo")
                 self._sso_handler.render_error(request, "fetch_error", str(e))
                 return
+        elif id_token is not None:
+            userinfo = UserInfo(id_token)
         else:
-            try:
-                userinfo = await self._parse_id_token(token, nonce=session_data.nonce)
-            except Exception as e:
-                logger.exception("Invalid id_token")
-                self._sso_handler.render_error(request, "invalid_token", str(e))
-                return
+            logger.error("Missing id_token in token response")
+            self._sso_handler.render_error(
+                request, "invalid_token", "Missing id_token in token response"
+            )
+            return
 
         # first check if we're doing a UIA
         if session_data.ui_auth_session_id:
@@ -884,7 +895,7 @@ class OidcProvider:
         # Call the mapper to register/login the user
         try:
             await self._complete_oidc_login(
-                userinfo, token, request, session_data.client_redirect_url
+                userinfo, token, request, session_data.client_redirect_url, sid
             )
         except MappingException as e:
             logger.exception("Could not map user")
@@ -896,6 +907,7 @@ class OidcProvider:
         token: Token,
         request: SynapseRequest,
         client_redirect_url: str,
+        sid: Optional[str],
     ) -> None:
         """Given a UserInfo response, complete the login flow
 
@@ -954,7 +966,7 @@ class OidcProvider:
                         "Mapping provider does not support de-duplicating Matrix IDs"
                     )
 
-                attributes = await self._user_mapping_provider.map_user_attributes(  # type: ignore
+                attributes = await self._user_mapping_provider.map_user_attributes(
                     userinfo, token
                 )
 
@@ -1008,6 +1020,7 @@ class OidcProvider:
             oidc_response_to_user_attributes,
             grandfather_existing_users,
             extra_attributes,
+            auth_provider_session_id=sid,
         )
 
     def _remote_id_from_userinfo(self, userinfo: UserInfo) -> str:
@@ -1099,123 +1112,9 @@ class JwtClientSecret:
         return self._cached_secret
 
 
-class OidcSessionTokenGenerator:
-    """Methods for generating and checking OIDC Session cookies."""
-
-    def __init__(self, hs: "HomeServer"):
-        self._clock = hs.get_clock()
-        self._server_name = hs.hostname
-        self._macaroon_secret_key = hs.config.key.macaroon_secret_key
-
-    def generate_oidc_session_token(
-        self,
-        state: str,
-        session_data: "OidcSessionData",
-        duration_in_ms: int = (60 * 60 * 1000),
-    ) -> str:
-        """Generates a signed token storing data about an OIDC session.
-
-        When Synapse initiates an authorization flow, it creates a random state
-        and a random nonce. Those parameters are given to the provider and
-        should be verified when the client comes back from the provider.
-        It is also used to store the client_redirect_url, which is used to
-        complete the SSO login flow.
-
-        Args:
-            state: The ``state`` parameter passed to the OIDC provider.
-            session_data: data to include in the session token.
-            duration_in_ms: An optional duration for the token in milliseconds.
-                Defaults to an hour.
-
-        Returns:
-            A signed macaroon token with the session information.
-        """
-        macaroon = pymacaroons.Macaroon(
-            location=self._server_name,
-            identifier="key",
-            key=self._macaroon_secret_key,
-        )
-        macaroon.add_first_party_caveat("gen = 1")
-        macaroon.add_first_party_caveat("type = session")
-        macaroon.add_first_party_caveat("state = %s" % (state,))
-        macaroon.add_first_party_caveat("idp_id = %s" % (session_data.idp_id,))
-        macaroon.add_first_party_caveat("nonce = %s" % (session_data.nonce,))
-        macaroon.add_first_party_caveat(
-            "client_redirect_url = %s" % (session_data.client_redirect_url,)
-        )
-        macaroon.add_first_party_caveat(
-            "ui_auth_session_id = %s" % (session_data.ui_auth_session_id,)
-        )
-        now = self._clock.time_msec()
-        expiry = now + duration_in_ms
-        macaroon.add_first_party_caveat("time < %d" % (expiry,))
-
-        return macaroon.serialize()
-
-    def verify_oidc_session_token(
-        self, session: bytes, state: str
-    ) -> "OidcSessionData":
-        """Verifies and extract an OIDC session token.
-
-        This verifies that a given session token was issued by this homeserver
-        and extract the nonce and client_redirect_url caveats.
-
-        Args:
-            session: The session token to verify
-            state: The state the OIDC provider gave back
-
-        Returns:
-            The data extracted from the session cookie
-
-        Raises:
-            KeyError if an expected caveat is missing from the macaroon.
-        """
-        macaroon = pymacaroons.Macaroon.deserialize(session)
-
-        v = pymacaroons.Verifier()
-        v.satisfy_exact("gen = 1")
-        v.satisfy_exact("type = session")
-        v.satisfy_exact("state = %s" % (state,))
-        v.satisfy_general(lambda c: c.startswith("nonce = "))
-        v.satisfy_general(lambda c: c.startswith("idp_id = "))
-        v.satisfy_general(lambda c: c.startswith("client_redirect_url = "))
-        v.satisfy_general(lambda c: c.startswith("ui_auth_session_id = "))
-        satisfy_expiry(v, self._clock.time_msec)
-
-        v.verify(macaroon, self._macaroon_secret_key)
-
-        # Extract the session data from the token.
-        nonce = get_value_from_macaroon(macaroon, "nonce")
-        idp_id = get_value_from_macaroon(macaroon, "idp_id")
-        client_redirect_url = get_value_from_macaroon(macaroon, "client_redirect_url")
-        ui_auth_session_id = get_value_from_macaroon(macaroon, "ui_auth_session_id")
-        return OidcSessionData(
-            nonce=nonce,
-            idp_id=idp_id,
-            client_redirect_url=client_redirect_url,
-            ui_auth_session_id=ui_auth_session_id,
-        )
-
-
-@attr.s(frozen=True, slots=True, auto_attribs=True)
-class OidcSessionData:
-    """The attributes which are stored in a OIDC session cookie"""
-
-    # the Identity Provider being used
-    idp_id: str
-
-    # The `nonce` parameter passed to the OIDC provider.
-    nonce: str
-
-    # The URL the client gave when it initiated the flow. ("" if this is a UI Auth)
-    client_redirect_url: str
-
-    # The session ID of the ongoing UI Auth ("" if this is a login)
-    ui_auth_session_id: str
-
-
 class UserAttributeDict(TypedDict):
     localpart: Optional[str]
+    confirm_localpart: bool
     display_name: Optional[str]
     emails: List[str]
 
@@ -1295,6 +1194,11 @@ def jinja_finalize(thing: Any) -> Any:
 
 
 env = Environment(finalize=jinja_finalize)
+env.filters.update(
+    {
+        "localpart_from_email": _localpart_from_email_filter,
+    }
+)
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -1304,6 +1208,7 @@ class JinjaOidcMappingConfig:
     display_name_template: Optional[Template]
     email_template: Optional[Template]
     extra_attributes: Dict[str, Template]
+    confirm_localpart: bool = False
 
 
 class JinjaOidcMappingProvider(OidcMappingProvider[JinjaOidcMappingConfig]):
@@ -1345,12 +1250,17 @@ class JinjaOidcMappingProvider(OidcMappingProvider[JinjaOidcMappingConfig]):
                         "invalid jinja template", path=["extra_attributes", key]
                     ) from e
 
+        confirm_localpart = config.get("confirm_localpart") or False
+        if not isinstance(confirm_localpart, bool):
+            raise ConfigError("must be a bool", path=["confirm_localpart"])
+
         return JinjaOidcMappingConfig(
             subject_claim=subject_claim,
             localpart_template=localpart_template,
             display_name_template=display_name_template,
             email_template=email_template,
             extra_attributes=extra_attributes,
+            confirm_localpart=confirm_localpart,
         )
 
     def get_remote_user_id(self, userinfo: UserInfo) -> str:
@@ -1386,7 +1296,10 @@ class JinjaOidcMappingProvider(OidcMappingProvider[JinjaOidcMappingConfig]):
             emails.append(email)
 
         return UserAttributeDict(
-            localpart=localpart, display_name=display_name, emails=emails
+            localpart=localpart,
+            display_name=display_name,
+            emails=emails,
+            confirm_localpart=self._config.confirm_localpart,
         )
 
     async def get_extra_attributes(self, userinfo: UserInfo, token: Token) -> JsonDict:

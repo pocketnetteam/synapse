@@ -11,12 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import hashlib
 import json
 import logging
+import os
+import os.path
+import time
+import uuid
+import warnings
 from collections import deque
 from io import SEEK_END, BytesIO
-from typing import Callable, Dict, Iterable, MutableMapping, Optional, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    MutableMapping,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+from unittest.mock import Mock
 
 import attr
 from typing_extensions import Deque
@@ -28,6 +44,7 @@ from twisted.internet.defer import Deferred, fail, maybeDeferred, succeed
 from twisted.internet.error import DNSLookupError
 from twisted.internet.interfaces import (
     IAddress,
+    IConsumer,
     IHostnameResolver,
     IProtocol,
     IPullProducer,
@@ -43,13 +60,36 @@ from twisted.web.http_headers import Headers
 from twisted.web.resource import IResource
 from twisted.web.server import Request, Site
 
+from synapse.config.database import DatabaseConnectionConfig
+from synapse.events.presence_router import load_legacy_presence_router
+from synapse.events.spamcheck import load_legacy_spam_checkers
+from synapse.events.third_party_rules import load_legacy_third_party_event_rules
+from synapse.handlers.auth import load_legacy_password_auth_providers
 from synapse.http.site import SynapseRequest
+from synapse.logging.context import ContextResourceUsage
+from synapse.server import HomeServer
+from synapse.storage import DataStore
+from synapse.storage.engines import PostgresEngine, create_engine
 from synapse.types import JsonDict
 from synapse.util import Clock
 
-from tests.utils import setup_test_homeserver as _sth
+from tests.utils import (
+    LEAVE_DB,
+    POSTGRES_BASE_DB,
+    POSTGRES_HOST,
+    POSTGRES_PASSWORD,
+    POSTGRES_PORT,
+    POSTGRES_USER,
+    SQLITE_PERSIST_DB,
+    USE_POSTGRES_FOR_TESTS,
+    MockClock,
+    default_config,
+)
 
 logger = logging.getLogger(__name__)
+
+# the type of thing that can be passed into `make_request` in the headers list
+CustomHeaderType = Tuple[Union[str, bytes], Union[str, bytes]]
 
 
 class TimedOutException(Exception):
@@ -58,22 +98,43 @@ class TimedOutException(Exception):
     """
 
 
-@attr.s
+@implementer(IConsumer)
+@attr.s(auto_attribs=True)
 class FakeChannel:
     """
     A fake Twisted Web Channel (the part that interfaces with the
     wire).
     """
 
-    site = attr.ib(type=Union[Site, "FakeSite"])
-    _reactor = attr.ib()
-    result = attr.ib(type=dict, default=attr.Factory(dict))
-    _ip = attr.ib(type=str, default="127.0.0.1")
+    site: Union[Site, "FakeSite"]
+    _reactor: MemoryReactorClock
+    result: dict = attr.Factory(dict)
+    _ip: str = "127.0.0.1"
     _producer: Optional[Union[IPullProducer, IPushProducer]] = None
+    resource_usage: Optional[ContextResourceUsage] = None
+    _request: Optional[Request] = None
 
     @property
-    def json_body(self):
-        return json.loads(self.text_body)
+    def request(self) -> Request:
+        assert self._request is not None
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        assert self._request is None
+        self._request = request
+
+    @property
+    def json_body(self) -> JsonDict:
+        body = json.loads(self.text_body)
+        assert isinstance(body, dict)
+        return body
+
+    @property
+    def json_list(self) -> List[JsonDict]:
+        body = json.loads(self.text_body)
+        assert isinstance(body, list)
+        return body
 
     @property
     def text_body(self) -> str:
@@ -90,7 +151,7 @@ class FakeChannel:
         return self.result.get("done", False)
 
     @property
-    def code(self):
+    def code(self) -> int:
         if not self.result:
             raise Exception("No result yet.")
         return int(self.result["code"])
@@ -110,7 +171,7 @@ class FakeChannel:
         self.result["reason"] = reason
         self.result["headers"] = headers
 
-    def write(self, content):
+    def write(self, content: bytes) -> None:
         assert isinstance(content, bytes), "Should be bytes! " + repr(content)
 
         if "body" not in self.result:
@@ -118,11 +179,16 @@ class FakeChannel:
 
         self.result["body"] += content
 
-    def registerProducer(self, producer, streaming):
+    # Type ignore: mypy doesn't like the fact that producer isn't an IProducer.
+    def registerProducer(  # type: ignore[override]
+        self,
+        producer: Union[IPullProducer, IPushProducer],
+        streaming: bool,
+    ) -> None:
         self._producer = producer
         self.producerStreaming = streaming
 
-        def _produce():
+        def _produce() -> None:
             if self._producer:
                 self._producer.resumeProducing()
                 self._reactor.callLater(0.1, _produce)
@@ -130,29 +196,32 @@ class FakeChannel:
         if not streaming:
             self._reactor.callLater(0.0, _produce)
 
-    def unregisterProducer(self):
+    def unregisterProducer(self) -> None:
         if self._producer is None:
             return
 
         self._producer = None
 
-    def requestDone(self, _self):
+    def requestDone(self, _self: Request) -> None:
         self.result["done"] = True
+        if isinstance(_self, SynapseRequest):
+            assert _self.logcontext is not None
+            self.resource_usage = _self.logcontext.get_resource_usage()
 
-    def getPeer(self):
-        # We give an address so that getClientIP returns a non null entry,
+    def getPeer(self) -> IAddress:
+        # We give an address so that getClientAddress/getClientIP returns a non null entry,
         # causing us to record the MAU
         return address.IPv4Address("TCP", self._ip, 3423)
 
-    def getHost(self):
+    def getHost(self) -> IAddress:
         # this is called by Request.__init__ to configure Request.host.
         return address.IPv4Address("TCP", "127.0.0.1", 8888)
 
-    def isSecure(self):
+    def isSecure(self) -> bool:
         return False
 
     @property
-    def transport(self):
+    def transport(self) -> "FakeChannel":
         return self
 
     def await_result(self, timeout_ms: int = 1000) -> None:
@@ -217,14 +286,12 @@ def make_request(
     path: Union[bytes, str],
     content: Union[bytes, str, JsonDict] = b"",
     access_token: Optional[str] = None,
-    request: Request = SynapseRequest,
+    request: Type[Request] = SynapseRequest,
     shorthand: bool = True,
     federation_auth_origin: Optional[bytes] = None,
     content_is_form: bool = False,
     await_result: bool = True,
-    custom_headers: Optional[
-        Iterable[Tuple[Union[bytes, str], Union[bytes, str]]]
-    ] = None,
+    custom_headers: Optional[Iterable[CustomHeaderType]] = None,
     client_ip: str = "127.0.0.1",
 ) -> FakeChannel:
     """
@@ -283,9 +350,11 @@ def make_request(
     channel = FakeChannel(site, reactor, ip=client_ip)
 
     req = request(channel, site)
+    channel.request = req
+
     req.content = BytesIO(content)
     # Twisted expects to be at the end of the content when parsing the request.
-    req.content.seek(SEEK_END)
+    req.content.seek(0, SEEK_END)
 
     if access_token:
         req.requestHeaders.addRawHeader(
@@ -442,14 +511,11 @@ class ThreadPool:
         return d
 
 
-def setup_test_homeserver(cleanup_func, *args, **kwargs):
+def _make_test_homeserver_synchronous(server: HomeServer) -> None:
     """
-    Set up a synchronous test server, driven by the reactor used by
-    the homeserver.
+    Make the given test homeserver's database interactions synchronous.
     """
-    server = _sth(cleanup_func, *args, **kwargs)
 
-    # Make the thread pool synchronous.
     clock = server.get_clock()
 
     for database in server.get_datastores().databases:
@@ -477,14 +543,13 @@ def setup_test_homeserver(cleanup_func, *args, **kwargs):
 
         pool.runWithConnection = runWithConnection
         pool.runInteraction = runInteraction
+        # Replace the thread pool with a threadless 'thread' pool
         pool.threadpool = ThreadPool(clock._reactor)
         pool.running = True
 
     # We've just changed the Databases to run DB transactions on the same
     # thread, so we need to disable the dedicated thread behaviour.
     server.get_datastores().main.USE_DEDICATED_DB_THREADS_FOR_EVENT_FETCHING = False
-
-    return server
 
 
 def get_clock() -> Tuple[ThreadedMemoryReactorClock, Clock]:
@@ -527,7 +592,10 @@ class FakeTransport:
     """
 
     _peer_address: Optional[IAddress] = attr.ib(default=None)
-    """The value to be returend by getPeer"""
+    """The value to be returned by getPeer"""
+
+    _host_address: Optional[IAddress] = attr.ib(default=None)
+    """The value to be returned by getHost"""
 
     disconnecting = False
     disconnected = False
@@ -536,11 +604,11 @@ class FakeTransport:
     producer = attr.ib(default=None)
     autoflush = attr.ib(default=True)
 
-    def getPeer(self):
+    def getPeer(self) -> Optional[IAddress]:
         return self._peer_address
 
-    def getHost(self):
-        return None
+    def getHost(self) -> Optional[IAddress]:
+        return self._host_address
 
     def loseConnection(self, reason=None):
         if not self.disconnecting:
@@ -665,3 +733,198 @@ def connect_client(
     client.makeConnection(FakeTransport(server, reactor))
 
     return client, server
+
+
+class TestHomeServer(HomeServer):
+    DATASTORE_CLASS = DataStore
+
+
+def setup_test_homeserver(
+    cleanup_func,
+    name="test",
+    config=None,
+    reactor=None,
+    homeserver_to_use: Type[HomeServer] = TestHomeServer,
+    **kwargs,
+):
+    """
+    Setup a homeserver suitable for running tests against.  Keyword arguments
+    are passed to the Homeserver constructor.
+
+    If no datastore is supplied, one is created and given to the homeserver.
+
+    Args:
+        cleanup_func : The function used to register a cleanup routine for
+                       after the test.
+
+    Calling this method directly is deprecated: you should instead derive from
+    HomeserverTestCase.
+    """
+    if reactor is None:
+        from twisted.internet import reactor
+
+    if config is None:
+        config = default_config(name, parse=True)
+
+    config.caches.resize_all_caches()
+    config.ldap_enabled = False
+
+    if "clock" not in kwargs:
+        kwargs["clock"] = MockClock()
+
+    if USE_POSTGRES_FOR_TESTS:
+        test_db = "synapse_test_%s" % uuid.uuid4().hex
+
+        database_config = {
+            "name": "psycopg2",
+            "args": {
+                "database": test_db,
+                "host": POSTGRES_HOST,
+                "password": POSTGRES_PASSWORD,
+                "user": POSTGRES_USER,
+                "port": POSTGRES_PORT,
+                "cp_min": 1,
+                "cp_max": 5,
+            },
+        }
+    else:
+        if SQLITE_PERSIST_DB:
+            # The current working directory is in _trial_temp, so this gets created within that directory.
+            test_db_location = os.path.abspath("test.db")
+            logger.debug("Will persist db to %s", test_db_location)
+            # Ensure each test gets a clean database.
+            try:
+                os.remove(test_db_location)
+            except FileNotFoundError:
+                pass
+            else:
+                logger.debug("Removed existing DB at %s", test_db_location)
+        else:
+            test_db_location = ":memory:"
+
+        database_config = {
+            "name": "sqlite3",
+            "args": {"database": test_db_location, "cp_min": 1, "cp_max": 1},
+        }
+
+    if "db_txn_limit" in kwargs:
+        database_config["txn_limit"] = kwargs["db_txn_limit"]
+
+    database = DatabaseConnectionConfig("master", database_config)
+    config.database.databases = [database]
+
+    db_engine = create_engine(database.config)
+
+    # Create the database before we actually try and connect to it, based off
+    # the template database we generate in setupdb()
+    if isinstance(db_engine, PostgresEngine):
+        db_conn = db_engine.module.connect(
+            database=POSTGRES_BASE_DB,
+            user=POSTGRES_USER,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            password=POSTGRES_PASSWORD,
+        )
+        db_conn.autocommit = True
+        cur = db_conn.cursor()
+        cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
+        cur.execute(
+            "CREATE DATABASE %s WITH TEMPLATE %s;" % (test_db, POSTGRES_BASE_DB)
+        )
+        cur.close()
+        db_conn.close()
+
+    hs = homeserver_to_use(
+        name,
+        config=config,
+        version_string="Synapse/tests",
+        reactor=reactor,
+    )
+
+    # Install @cache_in_self attributes
+    for key, val in kwargs.items():
+        setattr(hs, "_" + key, val)
+
+    # Mock TLS
+    hs.tls_server_context_factory = Mock()
+
+    hs.setup()
+    if homeserver_to_use == TestHomeServer:
+        hs.setup_background_tasks()
+
+    if isinstance(db_engine, PostgresEngine):
+        database = hs.get_datastores().databases[0]
+
+        # We need to do cleanup on PostgreSQL
+        def cleanup():
+            import psycopg2
+
+            # Close all the db pools
+            database._db_pool.close()
+
+            dropped = False
+
+            # Drop the test database
+            db_conn = db_engine.module.connect(
+                database=POSTGRES_BASE_DB,
+                user=POSTGRES_USER,
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                password=POSTGRES_PASSWORD,
+            )
+            db_conn.autocommit = True
+            cur = db_conn.cursor()
+
+            # Try a few times to drop the DB. Some things may hold on to the
+            # database for a few more seconds due to flakiness, preventing
+            # us from dropping it when the test is over. If we can't drop
+            # it, warn and move on.
+            for _ in range(5):
+                try:
+                    cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
+                    db_conn.commit()
+                    dropped = True
+                except psycopg2.OperationalError as e:
+                    warnings.warn(
+                        "Couldn't drop old db: " + str(e), category=UserWarning
+                    )
+                    time.sleep(0.5)
+
+            cur.close()
+            db_conn.close()
+
+            if not dropped:
+                warnings.warn("Failed to drop old DB.", category=UserWarning)
+
+        if not LEAVE_DB:
+            # Register the cleanup hook
+            cleanup_func(cleanup)
+
+    # bcrypt is far too slow to be doing in unit tests
+    # Need to let the HS build an auth handler and then mess with it
+    # because AuthHandler's constructor requires the HS, so we can't make one
+    # beforehand and pass it in to the HS's constructor (chicken / egg)
+    async def hash(p):
+        return hashlib.md5(p.encode("utf8")).hexdigest()
+
+    hs.get_auth_handler().hash = hash
+
+    async def validate_hash(p, h):
+        return hashlib.md5(p.encode("utf8")).hexdigest() == h
+
+    hs.get_auth_handler().validate_hash = validate_hash
+
+    # Make the threadpool and database transactions synchronous for testing.
+    _make_test_homeserver_synchronous(hs)
+
+    # Load any configured modules into the homeserver
+    module_api = hs.get_module_api()
+    for module, config in hs.config.modules.loaded_modules:
+        module(config=config, api=module_api)
+
+    load_legacy_spam_checkers(hs)
+    load_legacy_third_party_event_rules(hs)
+    load_legacy_presence_router(hs)
+    load_legacy_password_auth_providers(hs)
+
+    return hs

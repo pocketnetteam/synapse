@@ -29,7 +29,7 @@ from synapse.api.errors import Codes, SynapseError, cs_error
 from synapse.http.server import finish_request, respond_with_json
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import make_deferred_yieldable
-from synapse.util.stringutils import is_ascii
+from synapse.util.stringutils import is_ascii, parse_and_validate_server_name
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,19 @@ TEXT_CONTENT_TYPES = [
 
 
 def parse_media_id(request: Request) -> Tuple[str, str, Optional[str]]:
+    """Parses the server name, media ID and optional file name from the request URI
+
+    Also performs some rough validation on the server name.
+
+    Args:
+        request: The `Request`.
+
+    Returns:
+        A tuple containing the parsed server name, media ID and optional file name.
+
+    Raises:
+        SynapseError(404): if parsing or validation fail for any reason
+    """
     try:
         # The type on postpath seems incorrect in Twisted 21.2.0.
         postpath: List[bytes] = request.postpath  # type: ignore
@@ -61,6 +74,9 @@ def parse_media_id(request: Request) -> Tuple[str, str, Optional[str]]:
         server_name_bytes, media_id_bytes = postpath[:2]
         server_name = server_name_bytes.decode("utf-8")
         media_id = media_id_bytes.decode("utf8")
+
+        # Validate the server name, raising if invalid
+        parse_and_validate_server_name(server_name)
 
         file_name = None
         if len(postpath) > 2:
@@ -238,30 +254,32 @@ async def respond_with_responder(
         file_size: Size in bytes of the media. If not known it should be None
         upload_name: The name of the requested file, if any.
     """
-    if request._disconnected:
-        logger.warning(
-            "Not sending response to request %s, already disconnected.", request
-        )
-        return
-
     if not responder:
         respond_404(request)
         return
 
-    logger.debug("Responding to media request with responder %s", responder)
-    add_file_headers(request, media_type, file_size, upload_name)
-    try:
-        with responder:
-            await responder.write_to_consumer(request)
-    except Exception as e:
-        # The majority of the time this will be due to the client having gone
-        # away. Unfortunately, Twisted simply throws a generic exception at us
-        # in that case.
-        logger.warning("Failed to write to consumer: %s %s", type(e), e)
+    # If we have a responder we *must* use it as a context manager.
+    with responder:
+        if request._disconnected:
+            logger.warning(
+                "Not sending response to request %s, already disconnected.", request
+            )
+            return
 
-        # Unregister the producer, if it has one, so Twisted doesn't complain
-        if request.producer:
-            request.unregisterProducer()
+        logger.debug("Responding to media request with responder %s", responder)
+        add_file_headers(request, media_type, file_size, upload_name)
+        try:
+
+            await responder.write_to_consumer(request)
+        except Exception as e:
+            # The majority of the time this will be due to the client having gone
+            # away. Unfortunately, Twisted simply throws a generic exception at us
+            # in that case.
+            logger.warning("Failed to write to consumer: %s %s", type(e), e)
+
+            # Unregister the producer, if it has one, so Twisted doesn't complain
+            if request.producer:
+                request.unregisterProducer()
 
     finish_request(request)
 
@@ -282,7 +300,6 @@ class Responder:
         Returns:
             Resolves once the response has finished being written
         """
-        pass
 
     def __enter__(self) -> None:
         pass

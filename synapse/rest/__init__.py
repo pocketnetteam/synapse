@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from synapse.http.server import HttpServer, JsonResource
 from synapse.rest import admin
@@ -26,12 +26,13 @@ from synapse.rest.client import (
     directory,
     events,
     filter,
-    groups,
     initial_sync,
     keys,
     knock,
     login as v1_login,
+    login_token_request,
     logout,
+    mutual_rooms,
     notifications,
     openid,
     password_policy,
@@ -49,7 +50,6 @@ from synapse.rest.client import (
     room_keys,
     room_upgrade_rest_servlet,
     sendtodevice,
-    shared_rooms,
     sync,
     tags,
     thirdparty,
@@ -61,6 +61,8 @@ from synapse.rest.client import (
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+
+RegisterServletsFunc = Callable[["HomeServer", HttpServer], None]
 
 
 class ClientRestResource(JsonResource):
@@ -116,7 +118,6 @@ class ClientRestResource(JsonResource):
         thirdparty.register_servlets(hs, client_resource)
         sendtodevice.register_servlets(hs, client_resource)
         user_directory.register_servlets(hs, client_resource)
-        groups.register_servlets(hs, client_resource)
         room_upgrade_rest_servlet.register_servlets(hs, client_resource)
         room_batch.register_servlets(hs, client_resource)
         capabilities.register_servlets(hs, client_resource)
@@ -129,4 +130,5 @@ class ClientRestResource(JsonResource):
         admin.register_servlets_for_client_rest_resource(hs, client_resource)
 
         # unstable
-        shared_rooms.register_servlets(hs, client_resource)
+        mutual_rooms.register_servlets(hs, client_resource)
+        login_token_request.register_servlets(hs, client_resource)

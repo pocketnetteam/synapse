@@ -22,7 +22,6 @@ from synapse.api.errors import (
     ResourceLimitError,
     SynapseError,
 )
-from synapse.events.spamcheck import load_legacy_spam_checkers
 from synapse.spam_checker_api import RegistrationBehaviour
 from synapse.types import RoomAlias, RoomID, UserID, create_requester
 
@@ -144,17 +143,11 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
             config=hs_config, federation_client=self.mock_federation_client
         )
 
-        load_legacy_spam_checkers(hs)
-
-        module_api = hs.get_module_api()
-        for module, config in hs.config.modules.loaded_modules:
-            module(config=config, api=module_api)
-
         return hs
 
     def prepare(self, reactor, clock, hs):
         self.handler = self.hs.get_registration_handler()
-        self.store = self.hs.get_datastore()
+        self.store = self.hs.get_datastores().main
         self.lots_of_users = 100
         self.small_number_of_users = 1
 
@@ -167,12 +160,12 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
         result_user_id, result_token = self.get_success(
             self.get_or_create_user(requester, frank.localpart, "Frankie")
         )
-        self.assertEquals(result_user_id, user_id)
+        self.assertEqual(result_user_id, user_id)
         self.assertIsInstance(result_token, str)
         self.assertGreater(len(result_token), 20)
 
     def test_if_user_exists(self):
-        store = self.hs.get_datastore()
+        store = self.hs.get_datastores().main
         frank = UserID.from_string("@frank:test")
         self.get_success(
             store.register_user(user_id=frank.to_string(), password_hash=None)
@@ -183,7 +176,7 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
         result_user_id, result_token = self.get_success(
             self.get_or_create_user(requester, local_part, None)
         )
-        self.assertEquals(result_user_id, user_id)
+        self.assertEqual(result_user_id, user_id)
         self.assertTrue(result_token is not None)
 
     @override_config({"limit_usage_by_mau": False})
@@ -699,7 +692,7 @@ class RegistrationTestCase(unittest.HomeserverTestCase):
         """
         if localpart is None:
             raise SynapseError(400, "Request must include user id")
-        await self.hs.get_auth().check_auth_blocking()
+        await self.hs.get_auth_blocking().check_auth_blocking()
         need_register = True
 
         try:
@@ -757,7 +750,7 @@ class RemoteAutoJoinTestCase(unittest.HomeserverTestCase):
 
     def prepare(self, reactor, clock, hs):
         self.handler = self.hs.get_registration_handler()
-        self.store = self.hs.get_datastore()
+        self.store = self.hs.get_datastores().main
 
     @override_config({"auto_join_rooms": ["#room:remotetest"]})
     def test_auto_create_auto_join_remote_room(self):

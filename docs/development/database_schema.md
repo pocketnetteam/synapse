@@ -89,10 +89,66 @@ To do so, use `scripts-dev/make_full_schema.sh`. This will produce new
 
 Ensure postgres is installed, then run:
 
-    ./scripts-dev/make_full_schema.sh -p postgres_username -o output_dir/
+```sh
+./scripts-dev/make_full_schema.sh -p postgres_username -o output_dir/
+```
 
 NB at the time of writing, this script predates the split into separate `state`/`main`
 databases so will require updates to handle that correctly.
+
+## Delta files
+
+Delta files define the steps required to upgrade the database from an earlier version.
+They can be written as either a file containing a series of SQL statements, or a Python
+module.
+
+Synapse remembers which delta files it has applied to a database (they are stored in the
+`applied_schema_deltas` table) and will not re-apply them (even if a given file is
+subsequently updated).
+
+Delta files should be placed in a directory named `synapse/storage/schema/<database>/delta/<version>/`.
+They are applied in alphanumeric order, so  by convention the first two characters
+of the filename should be an integer such as `01`, to put the file in the right order.
+
+### SQL delta files
+
+These should be named `*.sql`, or —  for changes which should only be applied for a
+given database engine — `*.sql.posgres` or `*.sql.sqlite`. For example, a delta which
+adds a new column to the `foo` table might be called `01add_bar_to_foo.sql`.
+
+Note that our SQL parser is a bit simple - it understands comments (`--` and `/*...*/`),
+but complex statements which require a `;` in the middle of them (such as `CREATE
+TRIGGER`) are beyond it and you'll have to use a Python delta file.
+
+### Python delta files
+
+For more flexibility, a delta file can take the form of a python module. These should
+be named `*.py`. Note that database-engine-specific modules are not supported here –
+instead you can write `if isinstance(database_engine, PostgresEngine)` or similar.
+
+A Python delta module should define either or both of the following functions:
+
+```python
+import synapse.config.homeserver
+import synapse.storage.engines
+import synapse.storage.types
+
+
+def run_create(
+    cur: synapse.storage.types.Cursor,
+    database_engine: synapse.storage.engines.BaseDatabaseEngine,
+) -> None:
+    """Called whenever an existing or new database is to be upgraded"""
+    ...
+
+def run_upgrade(
+    cur: synapse.storage.types.Cursor,
+    database_engine: synapse.storage.engines.BaseDatabaseEngine,
+    config: synapse.config.homeserver.HomeServerConfig,
+) -> None:
+    """Called whenever an existing database is to be upgraded."""
+    ...
+```
 
 ## Boolean columns
 
@@ -102,9 +158,9 @@ same as integers.
 There are three separate aspects to this:
 
  * Any new boolean column must be added to the `BOOLEAN_COLUMNS` list in
-   `scripts/synapse_port_db`. This tells the port script to cast the integer
-   value from SQLite to a boolean before writing the value to the postgres
-   database.
+   `synapse/_scripts/synapse_port_db.py`. This tells the port script to cast
+   the integer value from SQLite to a boolean before writing the value to the
+   postgres database.
 
  * Before SQLite 3.23, `TRUE` and `FALSE` were not recognised as constants by
    SQLite, and the `IS [NOT] TRUE`/`IS [NOT] FALSE` operators were not
@@ -135,3 +191,27 @@ There are three separate aspects to this:
    flavour will be accepted by SQLite 3.22, but will give a column whose
    default value is the **string** `"FALSE"` - which, when cast back to a boolean
    in Python, evaluates to `True`.
+
+
+## `event_id` global uniqueness
+
+In room versions `1` and `2` it's possible to end up with two events with the
+same `event_id` (in the same or different rooms). After room version `3`, that
+can only happen with a hash collision, which we basically hope will never
+happen.
+
+There are several places in Synapse and even Matrix APIs like [`GET
+/_matrix/federation/v1/event/{eventId}`](https://spec.matrix.org/v1.1/server-server-api/#get_matrixfederationv1eventeventid)
+where we assume that event IDs are globally unique.
+
+But hash collisions are still possible, and by treating event IDs as room
+scoped, we can reduce the possibility of a hash collision. When scoping
+`event_id` in the database schema, it should be also accompanied by `room_id`
+(`PRIMARY KEY (room_id, event_id)`) and lookups should be done through the pair
+`(room_id, event_id)`.
+
+There has been a lot of debate on this in places like
+https://github.com/matrix-org/matrix-spec-proposals/issues/2779 and
+[MSC2848](https://github.com/matrix-org/matrix-spec-proposals/pull/2848) which
+has no resolution yet (as of 2022-09-01).
+

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import collections.abc
-from typing import Iterable, Union
+from typing import Iterable, Type, Union, cast
 
 import jsonschema
 
@@ -35,13 +35,17 @@ class EventValidator:
     def validate_new(self, event: EventBase, config: HomeServerConfig) -> None:
         """Validates the event has roughly the right format
 
+        Suitable for checking a locally-created event. It has stricter checks than
+        is appropriate for an event received over federation (for which, see
+        event_auth.validate_event_for_room_version)
+
         Args:
             event: The event to validate.
             config: The homeserver's configuration.
         """
         self.validate_builder(event)
 
-        if event.format_version == EventFormatVersions.V1:
+        if event.format_version == EventFormatVersions.ROOM_V1_V2:
             EventID.from_string(event.event_id)
 
         required = [
@@ -55,7 +59,7 @@ class EventValidator:
         ]
 
         for k in required:
-            if not hasattr(event, k):
+            if k not in event:
                 raise SynapseError(400, "Event does not have key %s" % (k,))
 
         # Check that the following keys have string values
@@ -103,7 +107,12 @@ class EventValidator:
             except jsonschema.ValidationError as e:
                 if e.path:
                     # example: "users_default": '0' is not of type 'integer'
-                    message = '"' + e.path[-1] + '": ' + e.message  # noqa: B306
+                    # cast safety: path entries can be integers, if we fail to validate
+                    # items in an array. However the POWER_LEVELS_SCHEMA doesn't expect
+                    # to see any arrays.
+                    message = (
+                        '"' + cast(str, e.path[-1]) + '": ' + e.message  # noqa: B306
+                    )
                     # jsonschema.ValidationError.message is a valid attribute
                 else:
                     # example: '0' is not of type 'integer'
@@ -246,7 +255,7 @@ POWER_LEVELS_SCHEMA = {
 
 # This could return something newer than Draft 7, but that's the current "latest"
 # validator.
-def _create_power_level_validator() -> jsonschema.Draft7Validator:
+def _create_power_level_validator() -> Type[jsonschema.Draft7Validator]:
     validator = jsonschema.validators.validator_for(POWER_LEVELS_SCHEMA)
 
     # by default jsonschema does not consider a frozendict to be an object so

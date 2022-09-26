@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import Iterable
+from typing import Any, Iterable
 
 from synapse.api.constants import EventTypes
 from synapse.config._base import Config, ConfigError
@@ -26,42 +26,10 @@ logger = logging.getLogger(__name__)
 class ApiConfig(Config):
     section = "api"
 
-    def read_config(self, config: JsonDict, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         validate_config(_MAIN_SCHEMA, config, ())
         self.room_prejoin_state = list(self._get_prejoin_state_types(config))
-
-    def generate_config_section(cls, **kwargs) -> str:
-        formatted_default_state_types = "\n".join(
-            "           # - %s" % (t,) for t in _DEFAULT_PREJOIN_STATE_TYPES
-        )
-
-        return """\
-        ## API Configuration ##
-
-        # Controls for the state that is shared with users who receive an invite
-        # to a room
-        #
-        room_prejoin_state:
-           # By default, the following state event types are shared with users who
-           # receive invites to the room:
-           #
-%(formatted_default_state_types)s
-           #
-           # Uncomment the following to disable these defaults (so that only the event
-           # types listed in 'additional_event_types' are shared). Defaults to 'false'.
-           #
-           #disable_default_event_types: true
-
-           # Additional state event types to share with users when they are invited
-           # to a room.
-           #
-           # By default, this list is empty (so only the default event types are shared).
-           #
-           #additional_event_types:
-           #  - org.example.custom.event.type
-        """ % {
-            "formatted_default_state_types": formatted_default_state_types
-        }
+        self.track_puppeted_user_ips = config.get("track_puppeted_user_ips", False)
 
     def _get_prejoin_state_types(self, config: JsonDict) -> Iterable[str]:
         """Get the event types to include in the prejoin state
@@ -107,6 +75,8 @@ _DEFAULT_PREJOIN_STATE_TYPES = [
     EventTypes.Name,
     # Per MSC1772.
     EventTypes.Create,
+    # Per MSC3173.
+    EventTypes.Topic,
 ]
 
 
@@ -136,5 +106,8 @@ _MAIN_SCHEMA = {
     "properties": {
         "room_prejoin_state": _ROOM_PREJOIN_STATE_CONFIG_SCHEMA,
         "room_invite_state_types": _ROOM_INVITE_STATE_TYPES_SCHEMA,
+        "track_puppeted_user_ips": {
+            "type": "boolean",
+        },
     },
 }

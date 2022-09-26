@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import logging
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import attr
 from canonicaljson import encode_canonical_json
@@ -25,6 +25,7 @@ from unpaddedbase64 import decode_base64
 
 from twisted.internet import defer
 
+from synapse.api.constants import EduTypes
 from synapse.api.errors import CodeMessageException, Codes, NotFoundError, SynapseError
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.logging.opentracing import log_kv, set_tag, tag_args, trace
@@ -36,7 +37,8 @@ from synapse.types import (
     get_verify_key_from_cross_signing_key,
 )
 from synapse.util import json_decoder, unwrapFirstError
-from synapse.util.async_helpers import Linearizer
+from synapse.util.async_helpers import Linearizer, delay_cancellation
+from synapse.util.cancellation import cancellable
 from synapse.util.retryutils import NotRetryingDestination
 
 if TYPE_CHECKING:
@@ -47,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 class E2eKeysHandler:
     def __init__(self, hs: "HomeServer"):
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.federation = hs.get_federation_client()
         self.device_handler = hs.get_device_handler()
         self.is_mine = hs.is_mine
@@ -65,10 +67,14 @@ class E2eKeysHandler:
         else:
             # Only register this edu handler on master as it requires writing
             # device updates to the db
-            #
-            # FIXME: switch to m.signing_key_update when MSC1756 is merged into the spec
             federation_registry.register_edu_handler(
-                "org.matrix.signing_key_update",
+                EduTypes.SIGNING_KEY_UPDATE,
+                self._edu_updater.incoming_signing_key_update,
+            )
+            # also handle the unstable version
+            # FIXME: remove this when enough servers have upgraded
+            federation_registry.register_edu_handler(
+                EduTypes.UNSTABLE_SIGNING_KEY_UPDATE,
                 self._edu_updater.incoming_signing_key_update,
             )
 
@@ -86,8 +92,13 @@ class E2eKeysHandler:
         )
 
     @trace
+    @cancellable
     async def query_devices(
-        self, query_body: JsonDict, timeout: int, from_user_id: str, from_device_id: str
+        self,
+        query_body: JsonDict,
+        timeout: int,
+        from_user_id: str,
+        from_device_id: Optional[str],
     ) -> JsonDict:
         """Handle a device key query from a client
 
@@ -114,10 +125,8 @@ class E2eKeysHandler:
             from_device_id: the device making the query. This is used to limit
                 the number of in-flight queries at a time.
         """
-        with await self._query_devices_linearizer.queue((from_user_id, from_device_id)):
-            device_keys_query: Dict[str, Iterable[str]] = query_body.get(
-                "device_keys", {}
-            )
+        async with self._query_devices_linearizer.queue((from_user_id, from_device_id)):
+            device_keys_query: Dict[str, List[str]] = query_body.get("device_keys", {})
 
             # separate users by domain.
             # make a map from domain to user_id to device_ids
@@ -131,8 +140,8 @@ class E2eKeysHandler:
                 else:
                     remote_queries[user_id] = device_ids
 
-            set_tag("local_key_query", local_query)
-            set_tag("remote_key_query", remote_queries)
+            set_tag("local_key_query", str(local_query))
+            set_tag("remote_key_query", str(remote_queries))
 
             # First get local devices.
             # A map of destination -> failure response.
@@ -166,6 +175,35 @@ class E2eKeysHandler:
                     user_ids_not_in_cache,
                     remote_results,
                 ) = await self.store.get_user_devices_from_cache(query_list)
+
+                # Check that the homeserver still shares a room with all cached users.
+                # Note that this check may be slightly racy when a remote user leaves a
+                # room after we have fetched their cached device list. In the worst case
+                # we will do extra federation queries for devices that we had cached.
+                cached_users = set(remote_results.keys())
+                valid_cached_users = (
+                    await self.store.get_users_server_still_shares_room_with(
+                        remote_results.keys()
+                    )
+                )
+                invalid_cached_users = cached_users - valid_cached_users
+                if invalid_cached_users:
+                    # Fix up results. If we get here, it means there was either a bug in
+                    # device list tracking, or we hit the race mentioned above.
+                    # TODO: In practice, this path is hit fairly often in existing
+                    #       deployments when clients query the keys of departed remote
+                    #       users. A background update to mark the appropriate device
+                    #       lists as unsubscribed is needed.
+                    #       https://github.com/matrix-org/synapse/issues/13651
+                    # Note that this currently introduces a failure mode when clients
+                    # are trying to decrypt old messages from a remote user whose
+                    # homeserver is no longer available. We may want to consider falling
+                    # back to the cached data when we fail to retrieve a device list
+                    # over federation for such remote users.
+                    user_ids_not_in_cache.update(invalid_cached_users)
+                    for invalid_user_id in invalid_cached_users:
+                        remote_results.pop(invalid_user_id)
+
                 for user_id, devices in remote_results.items():
                     user_devices = results.setdefault(user_id, {})
                     for device_id, device in devices.items():
@@ -201,98 +239,26 @@ class E2eKeysHandler:
                     r[user_id] = remote_queries[user_id]
 
             # Now fetch any devices that we don't have in our cache
-            @trace
-            async def do_remote_query(destination: str) -> None:
-                """This is called when we are querying the device list of a user on
-                a remote homeserver and their device list is not in the device list
-                cache. If we share a room with this user and we're not querying for
-                specific user we will update the cache with their device list.
-                """
-
-                destination_query = remote_queries_not_in_cache[destination]
-
-                # We first consider whether we wish to update the device list cache with
-                # the users device list. We want to track a user's devices when the
-                # authenticated user shares a room with the queried user and the query
-                # has not specified a particular device.
-                # If we update the cache for the queried user we remove them from further
-                # queries. We use the more efficient batched query_client_keys for all
-                # remaining users
-                user_ids_updated = []
-                for (user_id, device_list) in destination_query.items():
-                    if user_id in user_ids_updated:
-                        continue
-
-                    if device_list:
-                        continue
-
-                    room_ids = await self.store.get_rooms_for_user(user_id)
-                    if not room_ids:
-                        continue
-
-                    # We've decided we're sharing a room with this user and should
-                    # probably be tracking their device lists. However, we haven't
-                    # done an initial sync on the device list so we do it now.
-                    try:
-                        if self._is_master:
-                            user_devices = await self.device_handler.device_list_updater.user_device_resync(
-                                user_id
-                            )
-                        else:
-                            user_devices = await self._user_device_resync_client(
-                                user_id=user_id
-                            )
-
-                        user_devices = user_devices["devices"]
-                        user_results = results.setdefault(user_id, {})
-                        for device in user_devices:
-                            user_results[device["device_id"]] = device["keys"]
-                        user_ids_updated.append(user_id)
-                    except Exception as e:
-                        failures[destination] = _exception_to_failure(e)
-
-                if len(destination_query) == len(user_ids_updated):
-                    # We've updated all the users in the query and we do not need to
-                    # make any further remote calls.
-                    return
-
-                # Remove all the users from the query which we have updated
-                for user_id in user_ids_updated:
-                    destination_query.pop(user_id)
-
-                try:
-                    remote_result = await self.federation.query_client_keys(
-                        destination, {"device_keys": destination_query}, timeout=timeout
-                    )
-
-                    for user_id, keys in remote_result["device_keys"].items():
-                        if user_id in destination_query:
-                            results[user_id] = keys
-
-                    if "master_keys" in remote_result:
-                        for user_id, key in remote_result["master_keys"].items():
-                            if user_id in destination_query:
-                                cross_signing_keys["master_keys"][user_id] = key
-
-                    if "self_signing_keys" in remote_result:
-                        for user_id, key in remote_result["self_signing_keys"].items():
-                            if user_id in destination_query:
-                                cross_signing_keys["self_signing_keys"][user_id] = key
-
-                except Exception as e:
-                    failure = _exception_to_failure(e)
-                    failures[destination] = failure
-                    set_tag("error", True)
-                    set_tag("reason", failure)
-
+            # TODO It might make sense to propagate cancellations into the
+            #      deferreds which are querying remote homeservers.
             await make_deferred_yieldable(
-                defer.gatherResults(
-                    [
-                        run_in_background(do_remote_query, destination)
-                        for destination in remote_queries_not_in_cache
-                    ],
-                    consumeErrors=True,
-                ).addErrback(unwrapFirstError)
+                delay_cancellation(
+                    defer.gatherResults(
+                        [
+                            run_in_background(
+                                self._query_devices_for_destination,
+                                results,
+                                cross_signing_keys,
+                                failures,
+                                destination,
+                                queries,
+                                timeout,
+                            )
+                            for destination, queries in remote_queries_not_in_cache.items()
+                        ],
+                        consumeErrors=True,
+                    ).addErrback(unwrapFirstError)
+                )
             )
 
             ret = {"device_keys": results, "failures": failures}
@@ -301,6 +267,122 @@ class E2eKeysHandler:
 
             return ret
 
+    @trace
+    async def _query_devices_for_destination(
+        self,
+        results: JsonDict,
+        cross_signing_keys: JsonDict,
+        failures: Dict[str, JsonDict],
+        destination: str,
+        destination_query: Dict[str, Iterable[str]],
+        timeout: int,
+    ) -> None:
+        """This is called when we are querying the device list of a user on
+        a remote homeserver and their device list is not in the device list
+        cache. If we share a room with this user and we're not querying for
+        specific user we will update the cache with their device list.
+
+        Args:
+            results: A map from user ID to their device keys, which gets
+                updated with the newly fetched keys.
+            cross_signing_keys: Map from user ID to their cross signing keys,
+                which gets updated with the newly fetched keys.
+            failures: Map of destinations to failures that have occurred while
+                attempting to fetch keys.
+            destination: The remote server to query
+            destination_query: The query dict of devices to query the remote
+                server for.
+            timeout: The timeout for remote HTTP requests.
+        """
+
+        # We first consider whether we wish to update the device list cache with
+        # the users device list. We want to track a user's devices when the
+        # authenticated user shares a room with the queried user and the query
+        # has not specified a particular device.
+        # If we update the cache for the queried user we remove them from further
+        # queries. We use the more efficient batched query_client_keys for all
+        # remaining users
+        user_ids_updated = []
+        for (user_id, device_list) in destination_query.items():
+            if user_id in user_ids_updated:
+                continue
+
+            if device_list:
+                continue
+
+            room_ids = await self.store.get_rooms_for_user(user_id)
+            if not room_ids:
+                continue
+
+            # We've decided we're sharing a room with this user and should
+            # probably be tracking their device lists. However, we haven't
+            # done an initial sync on the device list so we do it now.
+            try:
+                if self._is_master:
+                    resync_results = await self.device_handler.device_list_updater.user_device_resync(
+                        user_id
+                    )
+                else:
+                    resync_results = await self._user_device_resync_client(
+                        user_id=user_id
+                    )
+
+                # Add the device keys to the results.
+                user_devices = resync_results["devices"]
+                user_results = results.setdefault(user_id, {})
+                for device in user_devices:
+                    user_results[device["device_id"]] = device["keys"]
+                user_ids_updated.append(user_id)
+
+                # Add any cross signing keys to the results.
+                master_key = resync_results.get("master_key")
+                self_signing_key = resync_results.get("self_signing_key")
+
+                if master_key:
+                    cross_signing_keys["master_keys"][user_id] = master_key
+
+                if self_signing_key:
+                    cross_signing_keys["self_signing_keys"][user_id] = self_signing_key
+            except Exception as e:
+                failures[destination] = _exception_to_failure(e)
+
+        if len(destination_query) == len(user_ids_updated):
+            # We've updated all the users in the query and we do not need to
+            # make any further remote calls.
+            return
+
+        # Remove all the users from the query which we have updated
+        for user_id in user_ids_updated:
+            destination_query.pop(user_id)
+
+        try:
+            remote_result = await self.federation.query_client_keys(
+                destination, {"device_keys": destination_query}, timeout=timeout
+            )
+
+            for user_id, keys in remote_result["device_keys"].items():
+                if user_id in destination_query:
+                    results[user_id] = keys
+
+            if "master_keys" in remote_result:
+                for user_id, key in remote_result["master_keys"].items():
+                    if user_id in destination_query:
+                        cross_signing_keys["master_keys"][user_id] = key
+
+            if "self_signing_keys" in remote_result:
+                for user_id, key in remote_result["self_signing_keys"].items():
+                    if user_id in destination_query:
+                        cross_signing_keys["self_signing_keys"][user_id] = key
+
+        except Exception as e:
+            failure = _exception_to_failure(e)
+            failures[destination] = failure
+            set_tag("error", True)
+            set_tag("reason", str(failure))
+
+        return
+
+    @cancellable
     async def get_cross_signing_keys_from_cache(
         self, query: Iterable[str], from_user_id: Optional[str]
     ) -> Dict[str, Dict[str, dict]]:
@@ -347,8 +429,9 @@ class E2eKeysHandler:
         }
 
     @trace
+    @cancellable
     async def query_local_devices(
-        self, query: Dict[str, Optional[List[str]]]
+        self, query: Mapping[str, Optional[List[str]]]
     ) -> Dict[str, Dict[str, dict]]:
         """Get E2E device keys for local users
 
@@ -359,7 +442,7 @@ class E2eKeysHandler:
         Returns:
             A map from user_id -> device_id -> device details
         """
-        set_tag("local_query", query)
+        set_tag("local_query", str(query))
         local_query: List[Tuple[str, Optional[str]]] = []
 
         result_dict: Dict[str, Dict[str, dict]] = {}
@@ -417,7 +500,7 @@ class E2eKeysHandler:
 
     @trace
     async def claim_one_time_keys(
-        self, query: Dict[str, Dict[str, Dict[str, str]]], timeout: int
+        self, query: Dict[str, Dict[str, Dict[str, str]]], timeout: Optional[int]
     ) -> JsonDict:
         local_query: List[Tuple[str, str, str]] = []
         remote_queries: Dict[str, Dict[str, Dict[str, str]]] = {}
@@ -431,8 +514,8 @@ class E2eKeysHandler:
                 domain = get_domain_from_id(user_id)
                 remote_queries.setdefault(domain, {})[user_id] = one_time_keys
 
-        set_tag("local_key_query", local_query)
-        set_tag("remote_key_query", remote_queries)
+        set_tag("local_key_query", str(local_query))
+        set_tag("remote_key_query", str(remote_queries))
 
         results = await self.store.claim_e2e_one_time_keys(local_query)
 
@@ -462,7 +545,7 @@ class E2eKeysHandler:
                 failure = _exception_to_failure(e)
                 failures[destination] = failure
                 set_tag("error", True)
-                set_tag("reason", failure)
+                set_tag("reason", str(failure))
 
         await make_deferred_yieldable(
             defer.gatherResults(
@@ -537,7 +620,9 @@ class E2eKeysHandler:
             log_kv(
                 {"message": "Did not update one_time_keys", "reason": "no keys given"}
             )
-        fallback_keys = keys.get("org.matrix.msc2732.fallback_keys", None)
+        fallback_keys = keys.get("fallback_keys") or keys.get(
+            "org.matrix.msc2732.fallback_keys"
+        )
         if fallback_keys and isinstance(fallback_keys, dict):
             log_kv(
                 {
@@ -563,7 +648,7 @@ class E2eKeysHandler:
 
         result = await self.store.count_e2e_one_time_keys(user_id, device_id)
 
-        set_tag("one_time_key_counts", result)
+        set_tag("one_time_key_counts", str(result))
         return {"one_time_key_counts": result}
 
     async def _upload_one_time_keys_for_user(
@@ -1060,22 +1145,19 @@ class E2eKeysHandler:
             # can request over federation
             raise NotFoundError("No %s key found for %s" % (key_type, user_id))
 
-        (
-            key,
-            key_id,
-            verify_key,
-        ) = await self._retrieve_cross_signing_keys_for_remote_user(user, key_type)
-
-        if key is None:
+        cross_signing_keys = await self._retrieve_cross_signing_keys_for_remote_user(
+            user, key_type
+        )
+        if cross_signing_keys is None:
             raise NotFoundError("No %s key found for %s" % (key_type, user_id))
 
-        return key, key_id, verify_key
+        return cross_signing_keys
 
     async def _retrieve_cross_signing_keys_for_remote_user(
         self,
         user: UserID,
         desired_key_type: str,
-    ) -> Tuple[Optional[dict], Optional[str], Optional[VerifyKey]]:
+    ) -> Optional[Tuple[Dict[str, Any], str, VerifyKey]]:
         """Queries cross-signing keys for a remote user and saves them to the database
 
         Only the key specified by `key_type` will be returned, while all retrieved keys
@@ -1101,12 +1183,10 @@ class E2eKeysHandler:
                 type(e),
                 e,
             )
-            return None, None, None
+            return None
 
         # Process each of the retrieved cross-signing keys
-        desired_key = None
-        desired_key_id = None
-        desired_verify_key = None
+        desired_key_data = None
         retrieved_device_ids = []
         for key_type in ["master", "self_signing"]:
             key_content = remote_result.get(key_type + "_key")
@@ -1151,9 +1231,7 @@ class E2eKeysHandler:
 
             # If this is the desired key type, save it and its ID/VerifyKey
             if key_type == desired_key_type:
-                desired_key = key_content
-                desired_verify_key = verify_key
-                desired_key_id = key_id
+                desired_key_data = key_content, key_id, verify_key
 
             # At the same time, store this key in the db for subsequent queries
             await self.store.set_e2e_cross_signing_key(
@@ -1167,7 +1245,7 @@ class E2eKeysHandler:
                 user.to_string(), retrieved_device_ids
             )
 
-        return desired_key, desired_key_id, desired_verify_key
+        return desired_key_data
 
 
 def _check_cross_signing_key(
@@ -1276,21 +1354,21 @@ def _one_time_keys_match(old_key_json: str, new_key: JsonDict) -> bool:
     return old_key == new_key_copy
 
 
-@attr.s(slots=True)
+@attr.s(slots=True, auto_attribs=True)
 class SignatureListItem:
     """An item in the signature list as used by upload_signatures_for_device_keys."""
 
-    signing_key_id = attr.ib(type=str)
-    target_user_id = attr.ib(type=str)
-    target_device_id = attr.ib(type=str)
-    signature = attr.ib(type=JsonDict)
+    signing_key_id: str
+    target_user_id: str
+    target_device_id: str
+    signature: JsonDict
 
 
 class SigningKeyEduUpdater:
     """Handles incoming signing key updates from federation and updates the DB"""
 
     def __init__(self, hs: "HomeServer", e2e_keys_handler: E2eKeysHandler):
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.federation = hs.get_federation_client()
         self.clock = hs.get_clock()
         self.e2e_keys_handler = e2e_keys_handler
@@ -1341,7 +1419,7 @@ class SigningKeyEduUpdater:
         device_handler = self.e2e_keys_handler.device_handler
         device_list_updater = device_handler.device_list_updater
 
-        with (await self._remote_edu_linearizer.queue(user_id)):
+        async with self._remote_edu_linearizer.queue(user_id):
             pending_updates = self._pending_updates.pop(user_id, [])
             if not pending_updates:
                 # This can happen since we batch updates

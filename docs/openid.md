@@ -21,6 +21,8 @@ such as [Github][github-idp].
 
 [google-idp]: https://developers.google.com/identity/protocols/oauth2/openid-connect
 [auth0]: https://auth0.com/
+[authentik]: https://goauthentik.io/
+[lemonldap]: https://lemonldap-ng.org/
 [okta]: https://www.okta.com/
 [dex-idp]: https://github.com/dexidp/dex
 [keycloak-idp]: https://www.keycloak.org/docs/latest/server_admin/#sso-protocols
@@ -43,8 +45,8 @@ as follows:
    maintainer.
 
 To enable the OpenID integration, you should then add a section to the `oidc_providers`
-setting in your configuration file (or uncomment one of the existing examples).
-See [sample_config.yaml](./sample_config.yaml) for some sample settings, as well as
+setting in your configuration file.
+See the [configuration manual](usage/configuration/config_documentation.md#oidc_providers) for some sample settings, as well as
 the text below for example configurations for specific providers.
 
 ## Sample configs
@@ -81,7 +83,7 @@ oidc_providers:
 
 ### Dex
 
-[Dex][dex-idp] is a simple, open-source, certified OpenID Connect Provider.
+[Dex][dex-idp] is a simple, open-source OpenID Connect Provider.
 Although it is designed to help building a full-blown provider with an
 external database, it can be configured with static passwords in a config file.
 
@@ -157,7 +159,7 @@ Follow the [Getting Started Guide](https://www.keycloak.org/getting-started) to 
 oidc_providers:
   - idp_id: keycloak
     idp_name: "My KeyCloak server"
-    issuer: "https://127.0.0.1:8443/auth/realms/{realm_name}"
+    issuer: "https://127.0.0.1:8443/realms/{realm_name}"
     client_id: "synapse"
     client_secret: "copy secret generated from above"
     scopes: ["openid", "profile"]
@@ -172,7 +174,9 @@ oidc_providers:
 
 1. Create a regular web application for Synapse
 2. Set the Allowed Callback URLs to `[synapse public baseurl]/_synapse/client/oidc/callback`
-3. Add a rule to add the `preferred_username` claim.
+3. Add a rule with any name to add the `preferred_username` claim. 
+(See https://auth0.com/docs/customize/rules/create-rules for more information on how to create rules.)
+   
    <details>
     <summary>Code sample</summary>
 
@@ -209,6 +213,78 @@ oidc_providers:
         display_name_template: "{{ user.name }}"
 ```
 
+### Authentik
+
+[Authentik][authentik] is an open-source IdP solution.
+
+1. Create a provider in Authentik, with type OAuth2/OpenID.
+2. The parameters are:
+- Client Type: Confidential
+- JWT Algorithm: RS256
+- Scopes: OpenID, Email and Profile
+- RSA Key: Select any available key
+- Redirect URIs: `[synapse public baseurl]/_synapse/client/oidc/callback`
+3. Create an application for synapse in Authentik and link it to the provider.
+4. Note the slug of your application, Client ID and Client Secret.
+
+Note: RSA keys must be used for signing for Authentik, ECC keys do not work.
+
+Synapse config:
+```yaml
+oidc_providers:
+  - idp_id: authentik
+    idp_name: authentik
+    discover: true
+    issuer: "https://your.authentik.example.org/application/o/your-app-slug/" # TO BE FILLED: domain and slug
+    client_id: "your client id" # TO BE FILLED
+    client_secret: "your client secret" # TO BE FILLED
+    scopes:
+      - "openid"
+      - "profile"
+      - "email"
+    user_mapping_provider:
+      config:
+        localpart_template: "{{ user.preferred_username }}"
+        display_name_template: "{{ user.preferred_username|capitalize }}" # TO BE FILLED: If your users have names in Authentik and you want those in Synapse, this should be replaced with user.name|capitalize.
+```
+
+### LemonLDAP
+
+[LemonLDAP::NG][lemonldap] is an open-source IdP solution.
+
+1. Create an OpenID Connect Relying Parties in LemonLDAP::NG
+2. The parameters are:
+- Client ID under the basic menu of the new Relying Parties (`Options > Basic >
+  Client ID`)
+- Client secret (`Options > Basic > Client secret`)
+- JWT Algorithm: RS256 within the security menu of the new Relying Parties
+  (`Options > Security > ID Token signature algorithm` and `Options > Security >
+  Access Token signature algorithm`)
+- Scopes: OpenID, Email and Profile
+- Allowed redirection addresses for login (`Options > Basic > Allowed
+  redirection addresses for login` ) :
+  `[synapse public baseurl]/_synapse/client/oidc/callback`
+
+Synapse config:
+```yaml
+oidc_providers:
+  - idp_id: lemonldap
+    idp_name: lemonldap
+    discover: true
+    issuer: "https://auth.example.org/" # TO BE FILLED: replace with your domain
+    client_id: "your client id" # TO BE FILLED
+    client_secret: "your client secret" # TO BE FILLED
+    scopes:
+      - "openid"
+      - "profile"
+      - "email"
+    user_mapping_provider:
+      config:
+        localpart_template: "{{ user.preferred_username }}}"
+        # TO BE FILLED: If your users have names in LemonLDAP::NG and you want those in Synapse, this should be replaced with user.name|capitalize or any valid filter.
+        display_name_template: "{{ user.preferred_username|capitalize }}"
+```
+
 ### GitHub
 
 [GitHub][github-idp] is a bit special as it is not an OpenID Connect compliant provider, but
@@ -219,7 +295,7 @@ can be used to retrieve information on the authenticated user. As the Synapse
 login mechanism needs an attribute to uniquely identify users, and that endpoint
 does not return a `sub` property, an alternative `subject_claim` has to be set.
 
-1. Create a new OAuth application: https://github.com/settings/applications/new.
+1. Create a new OAuth application: [https://github.com/settings/applications/new](https://github.com/settings/applications/new).
 2. Set the callback URL to `[synapse public baseurl]/_synapse/client/oidc/callback`.
 
 Synapse config:
@@ -248,10 +324,10 @@ oidc_providers:
 
 [Google][google-idp] is an OpenID certified authentication and authorisation provider.
 
-1. Set up a project in the Google API Console (see
-   https://developers.google.com/identity/protocols/oauth2/openid-connect#appsetup).
-2. Add an "OAuth Client ID" for a Web Application under "Credentials".
-3. Copy the Client ID and Client Secret, and add the following to your synapse config:
+1. Set up a project in the Google API Console (see 
+   [documentation](https://developers.google.com/identity/protocols/oauth2/openid-connect#appsetup)).
+3. Add an "OAuth Client ID" for a Web Application under "Credentials".
+4. Copy the Client ID and Client Secret, and add the following to your synapse config:
    ```yaml
    oidc_providers:
      - idp_id: google
@@ -318,9 +394,6 @@ oidc_providers:
 
 ### Facebook
 
-Like Github, Facebook provide a custom OAuth2 API rather than an OIDC-compliant
-one so requires a little more configuration.
-
 0. You will need a Facebook developer account. You can register for one
    [here](https://developers.facebook.com/async/registration/).
 1. On the [apps](https://developers.facebook.com/apps/) page of the developer
@@ -340,24 +413,28 @@ Synapse config:
     idp_name: Facebook
     idp_brand: "facebook"  # optional: styling hint for clients
     discover: false
-    issuer: "https://facebook.com"
+    issuer: "https://www.facebook.com"
     client_id: "your-client-id" # TO BE FILLED
     client_secret: "your-client-secret" # TO BE FILLED
     scopes: ["openid", "email"]
-    authorization_endpoint: https://facebook.com/dialog/oauth
-    token_endpoint: https://graph.facebook.com/v9.0/oauth/access_token
-    user_profile_method: "userinfo_endpoint"
-    userinfo_endpoint: "https://graph.facebook.com/v9.0/me?fields=id,name,email,picture"
+    authorization_endpoint: "https://facebook.com/dialog/oauth"
+    token_endpoint: "https://graph.facebook.com/v9.0/oauth/access_token"
+    jwks_uri: "https://www.facebook.com/.well-known/oauth/openid/jwks/"
     user_mapping_provider:
       config:
-        subject_claim: "id"
         display_name_template: "{{ user.name }}"
+        email_template: "{{ '{{ user.email }}' }}"
 ```
 
 Relevant documents:
- * https://developers.facebook.com/docs/facebook-login/manually-build-a-login-flow
- * Using Facebook's Graph API: https://developers.facebook.com/docs/graph-api/using-graph-api/
- * Reference to the User endpoint: https://developers.facebook.com/docs/graph-api/reference/user
+ * [Manually Build a Login Flow](https://developers.facebook.com/docs/facebook-login/manually-build-a-login-flow)
+ * [Using Facebook's Graph API](https://developers.facebook.com/docs/graph-api/using-graph-api/)
+ * [Reference to the User endpoint](https://developers.facebook.com/docs/graph-api/reference/user)
+
+Facebook do have an [OIDC discovery endpoint](https://www.facebook.com/.well-known/openid-configuration),
+but it has a `response_types_supported` which excludes "code" (which we rely on, and
+is even mentioned in their [documentation](https://developers.facebook.com/docs/facebook-login/manually-build-a-login-flow#login)),
+so we have to disable discovery and configure the URIs manually.
 
 ### Gitea
 
@@ -426,8 +503,8 @@ As well as the private key file, you will need:
  * Team ID: a 10-character ID associated with your developer account.
  * Key ID: the 10-character identifier for the key.
 
-https://help.apple.com/developer-account/?lang=en#/dev77c875b7e has more
-documentation on setting up SiWA.
+[Apple's developer documentation](https://help.apple.com/developer-account/?lang=en#/dev77c875b7e)
+has more information on setting up SiWA.
 
 The synapse config will look like this:
 
@@ -451,7 +528,7 @@ The synapse config will look like this:
         email_template: "{{ user.email }}"
 ```
 
-## Django OAuth Toolkit
+### Django OAuth Toolkit
 
 [django-oauth-toolkit](https://github.com/jazzband/django-oauth-toolkit) is a
 Django application providing out of the box all the endpoints, data and logic
@@ -460,8 +537,8 @@ needed to add OAuth2 capabilities to your Django projects. It supports
 
 Configuration on Django's side:
 
-1. Add an application: https://example.com/admin/oauth2_provider/application/add/ and choose parameters like this:
-* `Redirect uris`: https://synapse.example.com/_synapse/client/oidc/callback
+1. Add an application: `https://example.com/admin/oauth2_provider/application/add/` and choose parameters like this:
+* `Redirect uris`: `https://synapse.example.com/_synapse/client/oidc/callback`
 * `Client type`: `Confidential`
 * `Authorization grant type`: `Authorization code`
 * `Algorithm`: `HMAC with SHA-2 256`

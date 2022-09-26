@@ -1,4 +1,4 @@
-# Copyright 2018-2021 The Matrix.org Foundation C.I.C.
+# Copyright 2018-2022 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,13 +22,17 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized, parameterized_class
 
+from twisted.test.proto_helpers import MemoryReactor
+
 import synapse.rest.admin
 from synapse.api.constants import UserTypes
 from synapse.api.errors import Codes, HttpResponseException, ResourceLimitError
 from synapse.api.room_versions import RoomVersions
 from synapse.rest.client import devices, login, logout, profile, room, sync
 from synapse.rest.media.v1.filepath import MediaFilePaths
+from synapse.server import HomeServer
 from synapse.types import JsonDict, UserID
+from synapse.util import Clock
 
 from tests import unittest
 from tests.server import FakeSite, make_request
@@ -43,7 +47,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
         profile.register_servlets,
     ]
 
-    def make_homeserver(self, reactor, clock):
+    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
 
         self.url = "/_synapse/admin/v1/register"
 
@@ -60,12 +64,12 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         self.hs.config.registration.registration_shared_secret = "shared"
 
-        self.hs.get_media_repository = Mock()
-        self.hs.get_deactivate_account_handler = Mock()
+        self.hs.get_media_repository = Mock()  # type: ignore[assignment]
+        self.hs.get_deactivate_account_handler = Mock()  # type: ignore[assignment]
 
         return self.hs
 
-    def test_disabled(self):
+    def test_disabled(self) -> None:
         """
         If there is no shared secret, registration through this method will be
         prevented.
@@ -79,7 +83,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
             "Shared secret registration is not enabled", channel.json_body["error"]
         )
 
-    def test_get_nonce(self):
+    def test_get_nonce(self) -> None:
         """
         Calling GET on the endpoint will return a randomised nonce, using the
         homeserver's secrets provider.
@@ -92,7 +96,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
             self.assertEqual(channel.json_body, {"nonce": "abcd"})
 
-    def test_expired_nonce(self):
+    def test_expired_nonce(self) -> None:
         """
         Calling GET on the endpoint will return a randomised nonce, which will
         only last for SALT_TIMEOUT (60s).
@@ -117,7 +121,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("unrecognised nonce", channel.json_body["error"])
 
-    def test_register_incorrect_nonce(self):
+    def test_register_incorrect_nonce(self) -> None:
         """
         Only the provided nonce can be used, as it's checked in the MAC.
         """
@@ -126,21 +130,21 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         want_mac = hmac.new(key=b"shared", digestmod=hashlib.sha1)
         want_mac.update(b"notthenonce\x00bob\x00abc123\x00admin")
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
             "username": "bob",
             "password": "abc123",
             "admin": True,
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual("HMAC incorrect", channel.json_body["error"])
 
-    def test_register_correct_nonce(self):
+    def test_register_correct_nonce(self) -> None:
         """
         When the correct nonce is provided, and the right key is provided, the
         user is registered.
@@ -152,7 +156,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
         want_mac.update(
             nonce.encode("ascii") + b"\x00bob\x00abc123\x00admin\x00support"
         )
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
@@ -160,14 +164,14 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
             "password": "abc123",
             "admin": True,
             "user_type": UserTypes.SUPPORT,
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual("@bob:test", channel.json_body["user_id"])
 
-    def test_nonce_reuse(self):
+    def test_nonce_reuse(self) -> None:
         """
         A valid unrecognised nonce.
         """
@@ -176,14 +180,14 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         want_mac = hmac.new(key=b"shared", digestmod=hashlib.sha1)
         want_mac.update(nonce.encode("ascii") + b"\x00bob\x00abc123\x00admin")
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
             "username": "bob",
             "password": "abc123",
             "admin": True,
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
@@ -196,14 +200,14 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("unrecognised nonce", channel.json_body["error"])
 
-    def test_missing_parts(self):
+    def test_missing_parts(self) -> None:
         """
         Synapse will complain if you don't give nonce, username, password, and
         mac.  Admin and user_types are optional.  Additional checks are done for length
         and type.
         """
 
-        def nonce():
+        def nonce() -> str:
             channel = self.make_request("GET", self.url)
             return channel.json_body["nonce"]
 
@@ -296,7 +300,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("Invalid user type", channel.json_body["error"])
 
-    def test_displayname(self):
+    def test_displayname(self) -> None:
         """
         Test that displayname of new user is set
         """
@@ -307,13 +311,13 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         want_mac = hmac.new(key=b"shared", digestmod=hashlib.sha1)
         want_mac.update(nonce.encode("ascii") + b"\x00bob1\x00abc123\x00notadmin")
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
             "username": "bob1",
             "password": "abc123",
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
 
         channel = self.make_request("POST", self.url, body)
@@ -331,14 +335,14 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         want_mac = hmac.new(key=b"shared", digestmod=hashlib.sha1)
         want_mac.update(nonce.encode("ascii") + b"\x00bob2\x00abc123\x00notadmin")
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
             "username": "bob2",
             "displayname": None,
             "password": "abc123",
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
@@ -355,14 +359,14 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         want_mac = hmac.new(key=b"shared", digestmod=hashlib.sha1)
         want_mac.update(nonce.encode("ascii") + b"\x00bob3\x00abc123\x00notadmin")
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
             "username": "bob3",
             "displayname": "",
             "password": "abc123",
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
@@ -378,14 +382,14 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
 
         want_mac = hmac.new(key=b"shared", digestmod=hashlib.sha1)
         want_mac.update(nonce.encode("ascii") + b"\x00bob4\x00abc123\x00notadmin")
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
             "username": "bob4",
             "displayname": "Bob's Name",
             "password": "abc123",
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
@@ -399,13 +403,13 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
     @override_config(
         {"limit_usage_by_mau": True, "max_mau_value": 2, "mau_trial_days": 0}
     )
-    def test_register_mau_limit_reached(self):
+    def test_register_mau_limit_reached(self) -> None:
         """
         Check we can register a user via the shared secret registration API
         even if the MAU limit is reached.
         """
         handler = self.hs.get_registration_handler()
-        store = self.hs.get_datastore()
+        store = self.hs.get_datastores().main
 
         # Set monthly active users to the limit
         store.get_monthly_active_count = Mock(
@@ -425,7 +429,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
         want_mac.update(
             nonce.encode("ascii") + b"\x00bob\x00abc123\x00admin\x00support"
         )
-        want_mac = want_mac.hexdigest()
+        want_mac_str = want_mac.hexdigest()
 
         body = {
             "nonce": nonce,
@@ -433,7 +437,7 @@ class UserRegisterTestCase(unittest.HomeserverTestCase):
             "password": "abc123",
             "admin": True,
             "user_type": UserTypes.SUPPORT,
-            "mac": want_mac,
+            "mac": want_mac_str,
         }
         channel = self.make_request("POST", self.url, body)
 
@@ -449,13 +453,13 @@ class UsersListTestCase(unittest.HomeserverTestCase):
     ]
     url = "/_synapse/admin/v2/users"
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
 
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
 
-    def test_no_auth(self):
+    def test_no_auth(self) -> None:
         """
         Try to list users without authentication.
         """
@@ -464,7 +468,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_requester_is_no_admin(self):
+    def test_requester_is_no_admin(self) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
@@ -476,7 +480,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
-    def test_all_users(self):
+    def test_all_users(self) -> None:
         """
         List all users, including deactivated users.
         """
@@ -496,7 +500,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         # Check that all fields are available
         self._check_fields(channel.json_body["users"])
 
-    def test_search_term(self):
+    def test_search_term(self) -> None:
         """Test that searching for a users works correctly"""
 
         def _search_test(
@@ -504,7 +508,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
             search_term: str,
             search_field: Optional[str] = "name",
             expected_http_code: Optional[int] = 200,
-        ):
+        ) -> None:
             """Search for a user and check that the returned user's id is a match
 
             Args:
@@ -574,7 +578,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         _search_test(None, "foo", "user_id")
         _search_test(None, "bar", "user_id")
 
-    def test_invalid_parameter(self):
+    def test_invalid_parameter(self) -> None:
         """
         If parameters are invalid, an error is returned.
         """
@@ -607,7 +611,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(400, channel.code, msg=channel.json_body)
-        self.assertEqual(Codes.UNKNOWN, channel.json_body["errcode"])
+        self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
         # invalid deactivated
         channel = self.make_request(
@@ -617,7 +621,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(400, channel.code, msg=channel.json_body)
-        self.assertEqual(Codes.UNKNOWN, channel.json_body["errcode"])
+        self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
         # unkown order_by
         channel = self.make_request(
@@ -627,7 +631,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(400, channel.code, msg=channel.json_body)
-        self.assertEqual(Codes.UNKNOWN, channel.json_body["errcode"])
+        self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
         # invalid search order
         channel = self.make_request(
@@ -637,9 +641,9 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(400, channel.code, msg=channel.json_body)
-        self.assertEqual(Codes.UNKNOWN, channel.json_body["errcode"])
+        self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
-    def test_limit(self):
+    def test_limit(self) -> None:
         """
         Testing list of users with limit
         """
@@ -660,7 +664,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertEqual(channel.json_body["next_token"], "5")
         self._check_fields(channel.json_body["users"])
 
-    def test_from(self):
+    def test_from(self) -> None:
         """
         Testing list of users with a defined starting point (from)
         """
@@ -681,7 +685,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertNotIn("next_token", channel.json_body)
         self._check_fields(channel.json_body["users"])
 
-    def test_limit_and_from(self):
+    def test_limit_and_from(self) -> None:
         """
         Testing list of users with a defined starting point and limit
         """
@@ -702,7 +706,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertEqual(len(channel.json_body["users"]), 10)
         self._check_fields(channel.json_body["users"])
 
-    def test_next_token(self):
+    def test_next_token(self) -> None:
         """
         Testing that `next_token` appears at the right place
         """
@@ -764,7 +768,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertEqual(len(channel.json_body["users"]), 1)
         self.assertNotIn("next_token", channel.json_body)
 
-    def test_order_by(self):
+    def test_order_by(self) -> None:
         """
         Testing order list with parameter `order_by`
         """
@@ -842,7 +846,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         expected_user_list: List[str],
         order_by: Optional[str],
         dir: Optional[str] = None,
-    ):
+    ) -> None:
         """Request the list of users in a certain order. Assert that order is what
         we expect
         Args:
@@ -869,7 +873,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
         self.assertEqual(expected_user_list, returned_order)
         self._check_fields(channel.json_body["users"])
 
-    def _check_fields(self, content: JsonDict):
+    def _check_fields(self, content: List[JsonDict]) -> None:
         """Checks that the expected user attributes are present in content
         Args:
             content: List that is checked for content
@@ -885,7 +889,7 @@ class UsersListTestCase(unittest.HomeserverTestCase):
             self.assertIn("avatar_url", u)
             self.assertIn("creation_ts", u)
 
-    def _create_users(self, number_users: int):
+    def _create_users(self, number_users: int) -> None:
         """
         Create a number of users
         Args:
@@ -900,6 +904,96 @@ class UsersListTestCase(unittest.HomeserverTestCase):
             )
 
 
+class UserDevicesTestCase(unittest.HomeserverTestCase):
+    """
+    Tests user device management-related Admin APIs.
+    """
+
+    servlets = [
+        synapse.rest.admin.register_servlets,
+        login.register_servlets,
+        sync.register_servlets,
+    ]
+
+    def prepare(
+        self, reactor: MemoryReactor, clock: Clock, homeserver: HomeServer
+    ) -> None:
+        # Set up an Admin user to query the Admin API with.
+        self.admin_user_id = self.register_user("admin", "pass", admin=True)
+        self.admin_user_token = self.login("admin", "pass")
+
+        # Set up a test user to query the devices of.
+        self.other_user_device_id = "TESTDEVICEID"
+        self.other_user_device_display_name = "My Test Device"
+        self.other_user_client_ip = "1.2.3.4"
+        self.other_user_user_agent = "EquestriaTechnology/123.0"
+
+        self.other_user_id = self.register_user("user", "pass", displayname="User1")
+        self.other_user_token = self.login(
+            "user",
+            "pass",
+            device_id=self.other_user_device_id,
+            additional_request_fields={
+                "initial_device_display_name": self.other_user_device_display_name,
+            },
+        )
+
+        # Have the "other user" make a request so that the "last_seen_*" fields are
+        # populated in the tests below.
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/sync",
+            access_token=self.other_user_token,
+            client_ip=self.other_user_client_ip,
+            custom_headers=[
+                ("User-Agent", self.other_user_user_agent),
+            ],
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+
+    def test_list_user_devices(self) -> None:
+        """
+        Tests that a user's devices and attributes are listed correctly via the Admin API.
+        """
+        # Request all devices of "other user"
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v2/users/{self.other_user_id}/devices",
+            access_token=self.admin_user_token,
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+
+        # Double-check we got the single device expected
+        user_devices = channel.json_body["devices"]
+        self.assertEqual(len(user_devices), 1)
+        self.assertEqual(channel.json_body["total"], 1)
+
+        # Check that all the attributes of the device reported are as expected.
+        self._validate_attributes_of_device_response(user_devices[0])
+
+        # Request just a single device for "other user" by its ID
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v2/users/{self.other_user_id}/devices/"
+            f"{self.other_user_device_id}",
+            access_token=self.admin_user_token,
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+
+        # Check that all the attributes of the device reported are as expected.
+        self._validate_attributes_of_device_response(channel.json_body)
+
+    def _validate_attributes_of_device_response(self, response: JsonDict) -> None:
+        # Check that all device expected attributes are present
+        self.assertEqual(response["user_id"], self.other_user_id)
+        self.assertEqual(response["device_id"], self.other_user_device_id)
+        self.assertEqual(response["display_name"], self.other_user_device_display_name)
+        self.assertEqual(response["last_seen_ip"], self.other_user_client_ip)
+        self.assertEqual(response["last_seen_user_agent"], self.other_user_user_agent)
+        self.assertIsInstance(response["last_seen_ts"], int)
+        self.assertGreater(response["last_seen_ts"], 0)
+
+
 class DeactivateAccountTestCase(unittest.HomeserverTestCase):
 
     servlets = [
@@ -907,8 +1001,8 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
 
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
@@ -930,7 +1024,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
             self.store.user_add_threepid("@user:test", "email", "foo@bar.com", 0, 0)
         )
 
-    def test_no_auth(self):
+    def test_no_auth(self) -> None:
         """
         Try to deactivate users without authentication.
         """
@@ -939,7 +1033,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_requester_is_not_admin(self):
+    def test_requester_is_not_admin(self) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
@@ -960,7 +1054,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual("You are not a server admin", channel.json_body["error"])
 
-    def test_user_does_not_exist(self):
+    def test_user_does_not_exist(self) -> None:
         """
         Tests that deactivation for a user that does not exist returns a 404
         """
@@ -974,7 +1068,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
         self.assertEqual(404, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.NOT_FOUND, channel.json_body["errcode"])
 
-    def test_erase_is_not_bool(self):
+    def test_erase_is_not_bool(self) -> None:
         """
         If parameter `erase` is not boolean, return an error
         """
@@ -989,7 +1083,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.BAD_JSON, channel.json_body["errcode"])
 
-    def test_user_is_not_local(self):
+    def test_user_is_not_local(self) -> None:
         """
         Tests that deactivation for a user that is not a local returns a 400
         """
@@ -1000,7 +1094,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("Can only deactivate local users", channel.json_body["error"])
 
-    def test_deactivate_user_erase_true(self):
+    def test_deactivate_user_erase_true(self) -> None:
         """
         Test deactivating a user and set `erase` to `true`
         """
@@ -1045,7 +1139,26 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
 
         self._is_erased("@user:test", True)
 
-    def test_deactivate_user_erase_false(self):
+    @override_config({"max_avatar_size": 1234})
+    def test_deactivate_user_erase_true_avatar_nonnull_but_empty(self) -> None:
+        """Check we can erase a user whose avatar is the empty string.
+
+        Reproduces #12257.
+        """
+        # Patch `self.other_user` to have an empty string as their avatar.
+        self.get_success(self.store.set_profile_avatar_url("user", ""))
+
+        # Check we can still erase them.
+        channel = self.make_request(
+            "POST",
+            self.url,
+            access_token=self.admin_user_tok,
+            content={"erase": True},
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+        self._is_erased("@user:test", True)
+
+    def test_deactivate_user_erase_false(self) -> None:
         """
         Test deactivating a user and set `erase` to `false`
         """
@@ -1090,7 +1203,7 @@ class DeactivateAccountTestCase(unittest.HomeserverTestCase):
 
         self._is_erased("@user:test", False)
 
-    def test_deactivate_user_erase_true_no_profile(self):
+    def test_deactivate_user_erase_true_no_profile(self) -> None:
         """
         Test deactivating a user and set `erase` to `true`
         if user has no profile information (stored in the database table `profiles`).
@@ -1161,33 +1274,34 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         sync.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
         self.auth_handler = hs.get_auth_handler()
 
         # create users and get access tokens
         # regardless of whether password login or SSO is allowed
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.get_success(
-            self.auth_handler.get_access_token_for_user_id(
+            self.auth_handler.create_access_token_for_user_id(
                 self.admin_user, device_id=None, valid_until_ms=None
             )
         )
 
         self.other_user = self.register_user("user", "pass", displayname="User")
         self.other_user_token = self.get_success(
-            self.auth_handler.get_access_token_for_user_id(
+            self.auth_handler.create_access_token_for_user_id(
                 self.other_user, device_id=None, valid_until_ms=None
             )
         )
+
         self.url_prefix = "/_synapse/admin/v2/users/%s"
         self.url_other_user = self.url_prefix % self.other_user
 
-    def test_requester_is_no_admin(self):
+    def test_requester_is_no_admin(self) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         channel = self.make_request(
             "GET",
@@ -1208,21 +1322,21 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual("You are not a server admin", channel.json_body["error"])
 
-    def test_user_does_not_exist(self):
+    def test_user_does_not_exist(self) -> None:
         """
         Tests that a lookup for a user that does not exist returns a 404
         """
 
         channel = self.make_request(
             "GET",
-            "/_synapse/admin/v2/users/@unknown_person:test",
+            self.url_prefix % "@unknown_person:test",
             access_token=self.admin_user_tok,
         )
 
         self.assertEqual(404, channel.code, msg=channel.json_body)
         self.assertEqual("M_NOT_FOUND", channel.json_body["errcode"])
 
-    def test_invalid_parameter(self):
+    def test_invalid_parameter(self) -> None:
         """
         If parameters are invalid, an error is returned.
         """
@@ -1317,7 +1431,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_PARAM, channel.json_body["errcode"])
 
-    def test_get_user(self):
+    def test_get_user(self) -> None:
         """
         Test a simple get of a user.
         """
@@ -1332,11 +1446,11 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("User", channel.json_body["displayname"])
         self._check_fields(channel.json_body)
 
-    def test_create_server_admin(self):
+    def test_create_server_admin(self) -> None:
         """
         Check that a new admin user is created successfully.
         """
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user (server admin)
         body = {
@@ -1381,11 +1495,11 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("mxc://fibble/wibble", channel.json_body["avatar_url"])
         self._check_fields(channel.json_body)
 
-    def test_create_user(self):
+    def test_create_user(self) -> None:
         """
         Check that a new regular user is created successfully.
         """
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user
         body = {
@@ -1448,7 +1562,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
     @override_config(
         {"limit_usage_by_mau": True, "max_mau_value": 2, "mau_trial_days": 0}
     )
-    def test_create_user_mau_limit_reached_active_admin(self):
+    def test_create_user_mau_limit_reached_active_admin(self) -> None:
         """
         Check that an admin can register a new user via the admin API
         even if the MAU limit is reached.
@@ -1477,7 +1591,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         )
 
         # Register new user with admin API
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user
         channel = self.make_request(
@@ -1494,7 +1608,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
     @override_config(
         {"limit_usage_by_mau": True, "max_mau_value": 2, "mau_trial_days": 0}
     )
-    def test_create_user_mau_limit_reached_passive_admin(self):
+    def test_create_user_mau_limit_reached_passive_admin(self) -> None:
         """
         Check that an admin can register a new user via the admin API
         even if the MAU limit is reached.
@@ -1514,7 +1628,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         )
 
         # Register new user with admin API
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user
         channel = self.make_request(
@@ -1539,17 +1653,18 @@ class UserRestTestCase(unittest.HomeserverTestCase):
             "public_baseurl": "https://example.com",
         }
     )
-    def test_create_user_email_notif_for_new_users(self):
+    def test_create_user_email_notif_for_new_users(self) -> None:
         """
         Check that a new regular user is created successfully and
         got an email pusher.
         """
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user
         body = {
             "password": "abc123",
-            "threepids": [{"medium": "email", "address": "bob@bob.bob"}],
+            # Note that the given email is not in canonical form.
+            "threepids": [{"medium": "email", "address": "Bob@bob.bob"}],
         }
 
         channel = self.make_request(
@@ -1564,10 +1679,9 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("email", channel.json_body["threepids"][0]["medium"])
         self.assertEqual("bob@bob.bob", channel.json_body["threepids"][0]["address"])
 
-        pushers = self.get_success(
-            self.store.get_pushers_by({"user_name": "@bob:test"})
+        pushers = list(
+            self.get_success(self.store.get_pushers_by({"user_name": "@bob:test"}))
         )
-        pushers = list(pushers)
         self.assertEqual(len(pushers), 1)
         self.assertEqual("@bob:test", pushers[0].user_name)
 
@@ -1581,12 +1695,12 @@ class UserRestTestCase(unittest.HomeserverTestCase):
             "public_baseurl": "https://example.com",
         }
     )
-    def test_create_user_email_no_notif_for_new_users(self):
+    def test_create_user_email_no_notif_for_new_users(self) -> None:
         """
         Check that a new regular user is created successfully and
         got not an email pusher.
         """
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user
         body = {
@@ -1606,13 +1720,47 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("email", channel.json_body["threepids"][0]["medium"])
         self.assertEqual("bob@bob.bob", channel.json_body["threepids"][0]["address"])
 
-        pushers = self.get_success(
-            self.store.get_pushers_by({"user_name": "@bob:test"})
+        pushers = list(
+            self.get_success(self.store.get_pushers_by({"user_name": "@bob:test"}))
         )
-        pushers = list(pushers)
         self.assertEqual(len(pushers), 0)
 
-    def test_set_password(self):
+    @override_config(
+        {
+            "email": {
+                "enable_notifs": True,
+                "notif_for_new_users": True,
+                "notif_from": "test@example.com",
+            },
+            "public_baseurl": "https://example.com",
+        }
+    )
+    def test_create_user_email_notif_for_new_users_with_msisdn_threepid(self) -> None:
+        """
+        Check that a new regular user is created successfully when they have a msisdn
+        threepid and email notif_for_new_users is set to True.
+        """
+        url = self.url_prefix % "@bob:test"
+
+        # Create user
+        body = {
+            "password": "abc123",
+            "threepids": [{"medium": "msisdn", "address": "1234567890"}],
+        }
+
+        channel = self.make_request(
+            "PUT",
+            url,
+            access_token=self.admin_user_tok,
+            content=body,
+        )
+
+        self.assertEqual(201, channel.code, msg=channel.json_body)
+        self.assertEqual("@bob:test", channel.json_body["name"])
+        self.assertEqual("msisdn", channel.json_body["threepids"][0]["medium"])
+        self.assertEqual("1234567890", channel.json_body["threepids"][0]["address"])
+
+    def test_set_password(self) -> None:
         """
         Test setting a new password for another user.
         """
@@ -1628,7 +1776,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self._check_fields(channel.json_body)
 
-    def test_set_displayname(self):
+    def test_set_displayname(self) -> None:
         """
         Test setting the displayname of another user.
         """
@@ -1656,7 +1804,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertEqual("foobar", channel.json_body["displayname"])
 
-    def test_set_threepid(self):
+    def test_set_threepid(self) -> None:
         """
         Test setting threepid for an other user.
         """
@@ -1737,7 +1885,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, len(channel.json_body["threepids"]))
         self._check_fields(channel.json_body)
 
-    def test_set_duplicate_threepid(self):
+    def test_set_duplicate_threepid(self) -> None:
         """
         Test setting the same threepid for a second user.
         First user loses and second user gets mapping of this threepid.
@@ -1824,7 +1972,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, len(channel.json_body["threepids"]))
         self._check_fields(channel.json_body)
 
-    def test_set_external_id(self):
+    def test_set_external_id(self) -> None:
         """
         Test setting external id for an other user.
         """
@@ -1922,7 +2070,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertEqual(0, len(channel.json_body["external_ids"]))
 
-    def test_set_duplicate_external_id(self):
+    def test_set_duplicate_external_id(self) -> None:
         """
         Test that setting the same external id for a second user fails and
         external id from user must not be changed.
@@ -2045,7 +2193,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         )
         self._check_fields(channel.json_body)
 
-    def test_deactivate_user(self):
+    def test_deactivate_user(self) -> None:
         """
         Test deactivating another user.
         """
@@ -2083,10 +2231,13 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertTrue(channel.json_body["deactivated"])
-        self.assertIsNone(channel.json_body["password_hash"])
         self.assertEqual(0, len(channel.json_body["threepids"]))
         self.assertEqual("mxc://servername/mediaid", channel.json_body["avatar_url"])
         self.assertEqual("User", channel.json_body["displayname"])
+
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", channel.json_body)
+
         # the user is deactivated, the threepid will be deleted
 
         # Get user
@@ -2099,13 +2250,15 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertTrue(channel.json_body["deactivated"])
-        self.assertIsNone(channel.json_body["password_hash"])
         self.assertEqual(0, len(channel.json_body["threepids"]))
         self.assertEqual("mxc://servername/mediaid", channel.json_body["avatar_url"])
         self.assertEqual("User", channel.json_body["displayname"])
 
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", channel.json_body)
+
     @override_config({"user_directory": {"enabled": True, "search_all_users": True}})
-    def test_change_name_deactivate_user_user_directory(self):
+    def test_change_name_deactivate_user_user_directory(self) -> None:
         """
         Test change profile information of a deactivated user and
         check that it does not appear in user directory
@@ -2113,6 +2266,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
 
         # is in user directory
         profile = self.get_success(self.store.get_user_in_directory(self.other_user))
+        assert profile is not None
         self.assertTrue(profile["display_name"] == "User")
 
         # Deactivate user
@@ -2148,7 +2302,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         profile = self.get_success(self.store.get_user_in_directory(self.other_user))
         self.assertIsNone(profile)
 
-    def test_reactivate_user(self):
+    def test_reactivate_user(self) -> None:
         """
         Test reactivating another user.
         """
@@ -2175,11 +2329,13 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertFalse(channel.json_body["deactivated"])
-        self.assertIsNotNone(channel.json_body["password_hash"])
         self._is_erased("@user:test", False)
+
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", channel.json_body)
 
     @override_config({"password_config": {"localdb_enabled": False}})
-    def test_reactivate_user_localdb_disabled(self):
+    def test_reactivate_user_localdb_disabled(self) -> None:
         """
         Test reactivating another user when using SSO.
         """
@@ -2207,11 +2363,13 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertFalse(channel.json_body["deactivated"])
-        self.assertIsNone(channel.json_body["password_hash"])
         self._is_erased("@user:test", False)
+
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", channel.json_body)
 
     @override_config({"password_config": {"enabled": False}})
-    def test_reactivate_user_password_disabled(self):
+    def test_reactivate_user_password_disabled(self) -> None:
         """
         Test reactivating another user when using SSO.
         """
@@ -2239,10 +2397,12 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertFalse(channel.json_body["deactivated"])
-        self.assertIsNone(channel.json_body["password_hash"])
         self._is_erased("@user:test", False)
 
-    def test_set_user_as_admin(self):
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", channel.json_body)
+
+    def test_set_user_as_admin(self) -> None:
         """
         Test setting the admin flag on a user.
         """
@@ -2270,7 +2430,7 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertTrue(channel.json_body["admin"])
 
-    def test_set_user_type(self):
+    def test_set_user_type(self) -> None:
         """
         Test changing user type.
         """
@@ -2321,12 +2481,12 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual("@user:test", channel.json_body["name"])
         self.assertIsNone(channel.json_body["user_type"])
 
-    def test_accidental_deactivation_prevention(self):
+    def test_accidental_deactivation_prevention(self) -> None:
         """
         Ensure an account can't accidentally be deactivated by using a str value
         for the deactivated body parameter
         """
-        url = "/_synapse/admin/v2/users/@bob:test"
+        url = self.url_prefix % "@bob:test"
 
         # Create user
         channel = self.make_request(
@@ -2390,19 +2550,21 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         # Deactivate the user.
         channel = self.make_request(
             "PUT",
-            "/_synapse/admin/v2/users/%s" % urllib.parse.quote(user_id),
+            self.url_prefix % urllib.parse.quote(user_id),
             access_token=self.admin_user_tok,
             content={"deactivated": True},
         )
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertTrue(channel.json_body["deactivated"])
-        self.assertIsNone(channel.json_body["password_hash"])
         self._is_erased(user_id, False)
         d = self.store.mark_user_erased(user_id)
         self.assertIsNone(self.get_success(d))
         self._is_erased(user_id, True)
 
-    def _check_fields(self, content: JsonDict):
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", channel.json_body)
+
+    def _check_fields(self, content: JsonDict) -> None:
         """Checks that the expected user attributes are present in content
 
         Args:
@@ -2414,12 +2576,15 @@ class UserRestTestCase(unittest.HomeserverTestCase):
         self.assertIn("admin", content)
         self.assertIn("deactivated", content)
         self.assertIn("shadow_banned", content)
-        self.assertIn("password_hash", content)
         self.assertIn("creation_ts", content)
         self.assertIn("appservice_id", content)
         self.assertIn("consent_server_notice_sent", content)
         self.assertIn("consent_version", content)
+        self.assertIn("consent_ts", content)
         self.assertIn("external_ids", content)
+
+        # This key was removed intentionally. Ensure it is not accidentally re-included.
+        self.assertNotIn("password_hash", content)
 
 
 class UserMembershipRestTestCase(unittest.HomeserverTestCase):
@@ -2430,7 +2595,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         room.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
 
@@ -2439,7 +2604,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
             self.other_user
         )
 
-    def test_no_auth(self):
+    def test_no_auth(self) -> None:
         """
         Try to list rooms of an user without authentication.
         """
@@ -2448,7 +2613,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_requester_is_no_admin(self):
+    def test_requester_is_no_admin(self) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
@@ -2463,7 +2628,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
-    def test_user_does_not_exist(self):
+    def test_user_does_not_exist(self) -> None:
         """
         Tests that a lookup for a user that does not exist returns an empty list
         """
@@ -2478,7 +2643,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, channel.json_body["total"])
         self.assertEqual(0, len(channel.json_body["joined_rooms"]))
 
-    def test_user_is_not_local(self):
+    def test_user_is_not_local(self) -> None:
         """
         Tests that a lookup for a user that is not a local and participates in no conversation returns an empty list
         """
@@ -2494,7 +2659,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, channel.json_body["total"])
         self.assertEqual(0, len(channel.json_body["joined_rooms"]))
 
-    def test_no_memberships(self):
+    def test_no_memberships(self) -> None:
         """
         Tests that a normal lookup for rooms is successfully
         if user has no memberships
@@ -2510,7 +2675,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, channel.json_body["total"])
         self.assertEqual(0, len(channel.json_body["joined_rooms"]))
 
-    def test_get_rooms(self):
+    def test_get_rooms(self) -> None:
         """
         Tests that a normal lookup for rooms is successfully
         """
@@ -2531,7 +2696,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(number_rooms, channel.json_body["total"])
         self.assertEqual(number_rooms, len(channel.json_body["joined_rooms"]))
 
-    def test_get_rooms_with_nonlocal_user(self):
+    def test_get_rooms_with_nonlocal_user(self) -> None:
         """
         Tests that a normal lookup for rooms is successful with a non-local user
         """
@@ -2539,7 +2704,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
         other_user_tok = self.login("user", "pass")
         event_builder_factory = self.hs.get_event_builder_factory()
         event_creation_handler = self.hs.get_event_creation_handler()
-        storage = self.hs.get_storage()
+        storage_controllers = self.hs.get_storage_controllers()
 
         # Create two rooms, one with a local user only and one with both a local
         # and remote user.
@@ -2564,7 +2729,7 @@ class UserMembershipRestTestCase(unittest.HomeserverTestCase):
             event_creation_handler.create_new_client_event(builder)
         )
 
-        self.get_success(storage.persistence.persist_event(event, context))
+        self.get_success(storage_controllers.persistence.persist_event(event, context))
 
         # Now get rooms
         url = "/_synapse/admin/v1/users/@joiner:remote_hs/joined_rooms"
@@ -2586,8 +2751,8 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
 
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
@@ -2597,7 +2762,7 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
             self.other_user
         )
 
-    def test_no_auth(self):
+    def test_no_auth(self) -> None:
         """
         Try to list pushers of an user without authentication.
         """
@@ -2606,7 +2771,7 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_requester_is_no_admin(self):
+    def test_requester_is_no_admin(self) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
@@ -2621,7 +2786,7 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
-    def test_user_does_not_exist(self):
+    def test_user_does_not_exist(self) -> None:
         """
         Tests that a lookup for a user that does not exist returns a 404
         """
@@ -2635,7 +2800,7 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(404, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.NOT_FOUND, channel.json_body["errcode"])
 
-    def test_user_is_not_local(self):
+    def test_user_is_not_local(self) -> None:
         """
         Tests that a lookup for a user that is not a local returns a 400
         """
@@ -2650,7 +2815,7 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("Can only look up local users", channel.json_body["error"])
 
-    def test_get_pushers(self):
+    def test_get_pushers(self) -> None:
         """
         Tests that a normal lookup for pushers is successfully
         """
@@ -2670,10 +2835,11 @@ class PushersRestTestCase(unittest.HomeserverTestCase):
         user_tuple = self.get_success(
             self.store.get_user_by_access_token(other_user_token)
         )
+        assert user_tuple is not None
         token_id = user_tuple.token_id
 
         self.get_success(
-            self.hs.get_pusherpool().add_pusher(
+            self.hs.get_pusherpool().add_or_update_pusher(
                 user_id=self.other_user,
                 access_token=token_id,
                 kind="http",
@@ -2714,8 +2880,8 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
         self.media_repo = hs.get_media_repository_resource()
         self.filepaths = MediaFilePaths(hs.config.media.media_store_path)
 
@@ -2728,7 +2894,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         )
 
     @parameterized.expand(["GET", "DELETE"])
-    def test_no_auth(self, method: str):
+    def test_no_auth(self, method: str) -> None:
         """Try to list media of an user without authentication."""
         channel = self.make_request(method, self.url, {})
 
@@ -2736,7 +2902,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
     @parameterized.expand(["GET", "DELETE"])
-    def test_requester_is_no_admin(self, method: str):
+    def test_requester_is_no_admin(self, method: str) -> None:
         """If the user is not a server admin, an error is returned."""
         other_user_token = self.login("user", "pass")
 
@@ -2750,7 +2916,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
     @parameterized.expand(["GET", "DELETE"])
-    def test_user_does_not_exist(self, method: str):
+    def test_user_does_not_exist(self, method: str) -> None:
         """Tests that a lookup for a user that does not exist returns a 404"""
         url = "/_synapse/admin/v1/users/@unknown_person:test/media"
         channel = self.make_request(
@@ -2763,7 +2929,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(Codes.NOT_FOUND, channel.json_body["errcode"])
 
     @parameterized.expand(["GET", "DELETE"])
-    def test_user_is_not_local(self, method: str):
+    def test_user_is_not_local(self, method: str) -> None:
         """Tests that a lookup for a user that is not a local returns a 400"""
         url = "/_synapse/admin/v1/users/@unknown_person:unknown_domain/media"
 
@@ -2776,7 +2942,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("Can only look up local users", channel.json_body["error"])
 
-    def test_limit_GET(self):
+    def test_limit_GET(self) -> None:
         """Testing list of media with limit"""
 
         number_media = 20
@@ -2795,7 +2961,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(channel.json_body["next_token"], 5)
         self._check_fields(channel.json_body["media"])
 
-    def test_limit_DELETE(self):
+    def test_limit_DELETE(self) -> None:
         """Testing delete of media with limit"""
 
         number_media = 20
@@ -2812,7 +2978,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(channel.json_body["total"], 5)
         self.assertEqual(len(channel.json_body["deleted_media"]), 5)
 
-    def test_from_GET(self):
+    def test_from_GET(self) -> None:
         """Testing list of media with a defined starting point (from)"""
 
         number_media = 20
@@ -2831,7 +2997,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertNotIn("next_token", channel.json_body)
         self._check_fields(channel.json_body["media"])
 
-    def test_from_DELETE(self):
+    def test_from_DELETE(self) -> None:
         """Testing delete of media with a defined starting point (from)"""
 
         number_media = 20
@@ -2848,7 +3014,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(channel.json_body["total"], 15)
         self.assertEqual(len(channel.json_body["deleted_media"]), 15)
 
-    def test_limit_and_from_GET(self):
+    def test_limit_and_from_GET(self) -> None:
         """Testing list of media with a defined starting point and limit"""
 
         number_media = 20
@@ -2867,7 +3033,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(len(channel.json_body["media"]), 10)
         self._check_fields(channel.json_body["media"])
 
-    def test_limit_and_from_DELETE(self):
+    def test_limit_and_from_DELETE(self) -> None:
         """Testing delete of media with a defined starting point and limit"""
 
         number_media = 20
@@ -2885,7 +3051,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(len(channel.json_body["deleted_media"]), 10)
 
     @parameterized.expand(["GET", "DELETE"])
-    def test_invalid_parameter(self, method: str):
+    def test_invalid_parameter(self, method: str) -> None:
         """If parameters are invalid, an error is returned."""
         # unkown order_by
         channel = self.make_request(
@@ -2895,7 +3061,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(400, channel.code, msg=channel.json_body)
-        self.assertEqual(Codes.UNKNOWN, channel.json_body["errcode"])
+        self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
         # invalid search order
         channel = self.make_request(
@@ -2905,7 +3071,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(400, channel.code, msg=channel.json_body)
-        self.assertEqual(Codes.UNKNOWN, channel.json_body["errcode"])
+        self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
         # negative limit
         channel = self.make_request(
@@ -2927,7 +3093,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
-    def test_next_token(self):
+    def test_next_token(self) -> None:
         """
         Testing that `next_token` appears at the right place
 
@@ -2992,7 +3158,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(len(channel.json_body["media"]), 1)
         self.assertNotIn("next_token", channel.json_body)
 
-    def test_user_has_no_media_GET(self):
+    def test_user_has_no_media_GET(self) -> None:
         """
         Tests that a normal lookup for media is successfully
         if user has no media created
@@ -3008,7 +3174,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, channel.json_body["total"])
         self.assertEqual(0, len(channel.json_body["media"]))
 
-    def test_user_has_no_media_DELETE(self):
+    def test_user_has_no_media_DELETE(self) -> None:
         """
         Tests that a delete is successful if user has no media
         """
@@ -3023,7 +3189,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, channel.json_body["total"])
         self.assertEqual(0, len(channel.json_body["deleted_media"]))
 
-    def test_get_media(self):
+    def test_get_media(self) -> None:
         """Tests that a normal lookup for media is successful"""
 
         number_media = 5
@@ -3042,7 +3208,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         self.assertNotIn("next_token", channel.json_body)
         self._check_fields(channel.json_body["media"])
 
-    def test_delete_media(self):
+    def test_delete_media(self) -> None:
         """Tests that a normal delete of media is successful"""
 
         number_media = 5
@@ -3071,7 +3237,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         for local_path in local_paths:
             self.assertFalse(os.path.exists(local_path))
 
-    def test_order_by(self):
+    def test_order_by(self) -> None:
         """
         Testing order list with parameter `order_by`
         """
@@ -3234,7 +3400,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
 
         return media_id
 
-    def _check_fields(self, content: JsonDict):
+    def _check_fields(self, content: List[JsonDict]) -> None:
         """Checks that the expected user attributes are present in content
         Args:
             content: List that is checked for content
@@ -3254,7 +3420,7 @@ class UserMediaRestTestCase(unittest.HomeserverTestCase):
         expected_media_list: List[str],
         order_by: Optional[str],
         dir: Optional[str] = None,
-    ):
+    ) -> None:
         """Request the list of media in a certain order. Assert that order is what
         we expect
         Args:
@@ -3294,8 +3460,8 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         logout.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
 
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
@@ -3313,14 +3479,14 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         return channel.json_body["access_token"]
 
-    def test_no_auth(self):
+    def test_no_auth(self) -> None:
         """Try to login as a user without authentication."""
         channel = self.make_request("POST", self.url, b"{}")
 
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_not_admin(self):
+    def test_not_admin(self) -> None:
         """Try to login as a user as a non-admin user."""
         channel = self.make_request(
             "POST", self.url, b"{}", access_token=self.other_user_tok
@@ -3328,7 +3494,7 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
 
         self.assertEqual(403, channel.code, msg=channel.json_body)
 
-    def test_send_event(self):
+    def test_send_event(self) -> None:
         """Test that sending event as a user works."""
         # Create a room.
         room_id = self.helper.create_room_as(self.other_user, tok=self.other_user_tok)
@@ -3342,7 +3508,7 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         event = self.get_success(self.store.get_event(event_id))
         self.assertEqual(event.sender, self.other_user)
 
-    def test_devices(self):
+    def test_devices(self) -> None:
         """Tests that logging in as a user doesn't create a new device for them."""
         # Login in as the user
         self._get_token()
@@ -3356,7 +3522,7 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         # We should only see the one device (from the login in `prepare`)
         self.assertEqual(len(channel.json_body["devices"]), 1)
 
-    def test_logout(self):
+    def test_logout(self) -> None:
         """Test that calling `/logout` with the token works."""
         # Login in as the user
         puppet_token = self._get_token()
@@ -3379,7 +3545,7 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         )
         self.assertEqual(200, channel.code, msg=channel.json_body)
 
-    def test_user_logout_all(self):
+    def test_user_logout_all(self) -> None:
         """Tests that the target user calling `/logout/all` does *not* expire
         the token.
         """
@@ -3406,7 +3572,7 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         )
         self.assertEqual(401, channel.code, msg=channel.json_body)
 
-    def test_admin_logout_all(self):
+    def test_admin_logout_all(self) -> None:
         """Tests that the admin user calling `/logout/all` does expire the
         token.
         """
@@ -3446,7 +3612,7 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
             "form_secret": "123secret",
         }
     )
-    def test_consent(self):
+    def test_consent(self) -> None:
         """Test that sending a message is not subject to the privacy policies."""
         # Have the admin user accept the terms.
         self.get_success(self.store.user_set_consent_version(self.admin_user, "1.0"))
@@ -3459,7 +3625,10 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
         # Now unaccept it and check that we can't send an event
         self.get_success(self.store.user_set_consent_version(self.other_user, "0.0"))
         self.helper.send_event(
-            room_id, "com.example.test", tok=self.other_user_tok, expect_code=403
+            room_id,
+            "com.example.test",
+            tok=self.other_user_tok,
+            expect_code=403,
         )
 
         # Login in as the user
@@ -3471,13 +3640,16 @@ class UserTokenRestTestCase(unittest.HomeserverTestCase):
     @override_config(
         {"limit_usage_by_mau": True, "max_mau_value": 1, "mau_trial_days": 0}
     )
-    def test_mau_limit(self):
+    def test_mau_limit(self) -> None:
         # Create a room as the admin user. This will bump the monthly active users to 1.
         room_id = self.helper.create_room_as(self.admin_user, tok=self.admin_user_tok)
 
         # Trying to join as the other user should fail due to reaching MAU limit.
         self.helper.join(
-            room_id, user=self.other_user, tok=self.other_user_tok, expect_code=403
+            room_id,
+            user=self.other_user,
+            tok=self.other_user_tok,
+            expect_code=403,
         )
 
         # Logging in as the other user and joining a room should work, even
@@ -3500,14 +3672,14 @@ class WhoisRestTestCase(unittest.HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
 
         self.other_user = self.register_user("user", "pass")
-        self.url = self.url_prefix % self.other_user
+        self.url = self.url_prefix % self.other_user  # type: ignore[attr-defined]
 
-    def test_no_auth(self):
+    def test_no_auth(self) -> None:
         """
         Try to get information of an user without authentication.
         """
@@ -3515,7 +3687,7 @@ class WhoisRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_requester_is_not_admin(self):
+    def test_requester_is_not_admin(self) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
@@ -3530,11 +3702,11 @@ class WhoisRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
-    def test_user_is_not_local(self):
+    def test_user_is_not_local(self) -> None:
         """
         Tests that a lookup for a user that is not a local returns a 400
         """
-        url = self.url_prefix % "@unknown_person:unknown_domain"
+        url = self.url_prefix % "@unknown_person:unknown_domain"  # type: ignore[attr-defined]
 
         channel = self.make_request(
             "GET",
@@ -3544,7 +3716,7 @@ class WhoisRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual("Can only whois a local user", channel.json_body["error"])
 
-    def test_get_whois_admin(self):
+    def test_get_whois_admin(self) -> None:
         """
         The lookup should succeed for an admin.
         """
@@ -3557,7 +3729,7 @@ class WhoisRestTestCase(unittest.HomeserverTestCase):
         self.assertEqual(self.other_user, channel.json_body["user_id"])
         self.assertIn("devices", channel.json_body)
 
-    def test_get_whois_user(self):
+    def test_get_whois_user(self) -> None:
         """
         The lookup should succeed for a normal user looking up their own information.
         """
@@ -3580,8 +3752,8 @@ class ShadowBanRestTestCase(unittest.HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
 
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
@@ -3592,40 +3764,44 @@ class ShadowBanRestTestCase(unittest.HomeserverTestCase):
             self.other_user
         )
 
-    def test_no_auth(self):
+    @parameterized.expand(["POST", "DELETE"])
+    def test_no_auth(self, method: str) -> None:
         """
         Try to get information of an user without authentication.
         """
-        channel = self.make_request("POST", self.url)
+        channel = self.make_request(method, self.url)
         self.assertEqual(401, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
-    def test_requester_is_not_admin(self):
+    @parameterized.expand(["POST", "DELETE"])
+    def test_requester_is_not_admin(self, method: str) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
         other_user_token = self.login("user", "pass")
 
-        channel = self.make_request("POST", self.url, access_token=other_user_token)
+        channel = self.make_request(method, self.url, access_token=other_user_token)
         self.assertEqual(403, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
-    def test_user_is_not_local(self):
+    @parameterized.expand(["POST", "DELETE"])
+    def test_user_is_not_local(self, method: str) -> None:
         """
         Tests that shadow-banning for a user that is not a local returns a 400
         """
         url = "/_synapse/admin/v1/whois/@unknown_person:unknown_domain"
 
-        channel = self.make_request("POST", url, access_token=self.admin_user_tok)
+        channel = self.make_request(method, url, access_token=self.admin_user_tok)
         self.assertEqual(400, channel.code, msg=channel.json_body)
 
-    def test_success(self):
+    def test_success(self) -> None:
         """
         Shadow-banning should succeed for an admin.
         """
         # The user starts off as not shadow-banned.
         other_user_token = self.login("user", "pass")
         result = self.get_success(self.store.get_user_by_access_token(other_user_token))
+        assert result is not None
         self.assertFalse(result.shadow_banned)
 
         channel = self.make_request("POST", self.url, access_token=self.admin_user_tok)
@@ -3634,7 +3810,20 @@ class ShadowBanRestTestCase(unittest.HomeserverTestCase):
 
         # Ensure the user is shadow-banned (and the cache was cleared).
         result = self.get_success(self.store.get_user_by_access_token(other_user_token))
+        assert result is not None
         self.assertTrue(result.shadow_banned)
+
+        # Un-shadow-ban the user.
+        channel = self.make_request(
+            "DELETE", self.url, access_token=self.admin_user_tok
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+        self.assertEqual({}, channel.json_body)
+
+        # Ensure the user is no longer shadow-banned (and the cache was cleared).
+        result = self.get_success(self.store.get_user_by_access_token(other_user_token))
+        assert result is not None
+        self.assertFalse(result.shadow_banned)
 
 
 class RateLimitTestCase(unittest.HomeserverTestCase):
@@ -3644,8 +3833,8 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         login.register_servlets,
     ]
 
-    def prepare(self, reactor, clock, hs):
-        self.store = hs.get_datastore()
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
 
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
@@ -3657,7 +3846,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         )
 
     @parameterized.expand(["GET", "POST", "DELETE"])
-    def test_no_auth(self, method: str):
+    def test_no_auth(self, method: str) -> None:
         """
         Try to get information of a user without authentication.
         """
@@ -3667,7 +3856,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
 
     @parameterized.expand(["GET", "POST", "DELETE"])
-    def test_requester_is_no_admin(self, method: str):
+    def test_requester_is_no_admin(self, method: str) -> None:
         """
         If the user is not a server admin, an error is returned.
         """
@@ -3683,7 +3872,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
 
     @parameterized.expand(["GET", "POST", "DELETE"])
-    def test_user_does_not_exist(self, method: str):
+    def test_user_does_not_exist(self, method: str) -> None:
         """
         Tests that a lookup for a user that does not exist returns a 404
         """
@@ -3705,7 +3894,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
             ("DELETE", "Only local users can be ratelimited"),
         ]
     )
-    def test_user_is_not_local(self, method: str, error_msg: str):
+    def test_user_is_not_local(self, method: str, error_msg: str) -> None:
         """
         Tests that a lookup for a user that is not a local returns a 400
         """
@@ -3722,7 +3911,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual(error_msg, channel.json_body["error"])
 
-    def test_invalid_parameter(self):
+    def test_invalid_parameter(self) -> None:
         """
         If parameters are invalid, an error is returned.
         """
@@ -3770,7 +3959,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         self.assertEqual(400, channel.code, msg=channel.json_body)
         self.assertEqual(Codes.INVALID_PARAM, channel.json_body["errcode"])
 
-    def test_return_zero_when_null(self):
+    def test_return_zero_when_null(self) -> None:
         """
         If values in database are `null` API should return an int `0`
         """
@@ -3796,7 +3985,7 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         self.assertEqual(0, channel.json_body["messages_per_second"])
         self.assertEqual(0, channel.json_body["burst_count"])
 
-    def test_success(self):
+    def test_success(self) -> None:
         """
         Rate-limiting (set/update/delete) should succeed for an admin.
         """
@@ -3861,3 +4050,180 @@ class RateLimitTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self.assertNotIn("messages_per_second", channel.json_body)
         self.assertNotIn("burst_count", channel.json_body)
+
+
+class AccountDataTestCase(unittest.HomeserverTestCase):
+
+    servlets = [
+        synapse.rest.admin.register_servlets,
+        login.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+        self.admin_user = self.register_user("admin", "pass", admin=True)
+        self.admin_user_tok = self.login("admin", "pass")
+
+        self.other_user = self.register_user("user", "pass")
+        self.url = f"/_synapse/admin/v1/users/{self.other_user}/accountdata"
+
+    def test_no_auth(self) -> None:
+        """Try to get information of a user without authentication."""
+        channel = self.make_request("GET", self.url, {})
+
+        self.assertEqual(401, channel.code, msg=channel.json_body)
+        self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
+
+    def test_requester_is_no_admin(self) -> None:
+        """If the user is not a server admin, an error is returned."""
+        other_user_token = self.login("user", "pass")
+
+        channel = self.make_request(
+            "GET",
+            self.url,
+            access_token=other_user_token,
+        )
+
+        self.assertEqual(403, channel.code, msg=channel.json_body)
+        self.assertEqual(Codes.FORBIDDEN, channel.json_body["errcode"])
+
+    def test_user_does_not_exist(self) -> None:
+        """Tests that a lookup for a user that does not exist returns a 404"""
+        url = "/_synapse/admin/v1/users/@unknown_person:test/override_ratelimit"
+
+        channel = self.make_request(
+            "GET",
+            url,
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(404, channel.code, msg=channel.json_body)
+        self.assertEqual(Codes.NOT_FOUND, channel.json_body["errcode"])
+
+    def test_user_is_not_local(self) -> None:
+        """Tests that a lookup for a user that is not a local returns a 400"""
+        url = "/_synapse/admin/v1/users/@unknown_person:unknown_domain/accountdata"
+
+        channel = self.make_request(
+            "GET",
+            url,
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(400, channel.code, msg=channel.json_body)
+        self.assertEqual("Can only look up local users", channel.json_body["error"])
+
+    def test_success(self) -> None:
+        """Request account data should succeed for an admin."""
+
+        # add account data
+        self.get_success(
+            self.store.add_account_data_for_user(self.other_user, "m.global", {"a": 1})
+        )
+        self.get_success(
+            self.store.add_account_data_to_room(
+                self.other_user, "test_room", "m.per_room", {"b": 2}
+            )
+        )
+
+        channel = self.make_request(
+            "GET",
+            self.url,
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+        self.assertEqual(
+            {"a": 1}, channel.json_body["account_data"]["global"]["m.global"]
+        )
+        self.assertEqual(
+            {"b": 2},
+            channel.json_body["account_data"]["rooms"]["test_room"]["m.per_room"],
+        )
+
+
+class UsersByExternalIdTestCase(unittest.HomeserverTestCase):
+
+    servlets = [
+        synapse.rest.admin.register_servlets,
+        login.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+
+        self.admin_user = self.register_user("admin", "pass", admin=True)
+        self.admin_user_tok = self.login("admin", "pass")
+
+        self.other_user = self.register_user("user", "pass")
+        self.get_success(
+            self.store.record_user_external_id(
+                "the-auth-provider", "the-external-id", self.other_user
+            )
+        )
+        self.get_success(
+            self.store.record_user_external_id(
+                "another-auth-provider", "a:complex@external/id", self.other_user
+            )
+        )
+
+    def test_no_auth(self) -> None:
+        """Try to lookup a user without authentication."""
+        url = (
+            "/_synapse/admin/v1/auth_providers/the-auth-provider/users/the-external-id"
+        )
+
+        channel = self.make_request(
+            "GET",
+            url,
+        )
+
+        self.assertEqual(401, channel.code, msg=channel.json_body)
+        self.assertEqual(Codes.MISSING_TOKEN, channel.json_body["errcode"])
+
+    def test_binding_does_not_exist(self) -> None:
+        """Tests that a lookup for an external ID that does not exist returns a 404"""
+        url = "/_synapse/admin/v1/auth_providers/the-auth-provider/users/unknown-id"
+
+        channel = self.make_request(
+            "GET",
+            url,
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(404, channel.code, msg=channel.json_body)
+        self.assertEqual(Codes.NOT_FOUND, channel.json_body["errcode"])
+
+    def test_success(self) -> None:
+        """Tests a successful external ID lookup"""
+        url = (
+            "/_synapse/admin/v1/auth_providers/the-auth-provider/users/the-external-id"
+        )
+
+        channel = self.make_request(
+            "GET",
+            url,
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+        self.assertEqual(
+            {"user_id": self.other_user},
+            channel.json_body,
+        )
+
+    def test_success_urlencoded(self) -> None:
+        """Tests a successful external ID lookup with an url-encoded ID"""
+        url = "/_synapse/admin/v1/auth_providers/another-auth-provider/users/a%3Acomplex%40external%2Fid"
+
+        channel = self.make_request(
+            "GET",
+            url,
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+        self.assertEqual(
+            {"user_id": self.other_user},
+            channel.json_body,
+        )

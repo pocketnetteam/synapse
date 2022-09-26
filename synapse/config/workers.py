@@ -1,4 +1,5 @@
 # Copyright 2016 OpenMarket Ltd
+# Copyright 2021 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Union
+import argparse
+import logging
+from typing import Any, Dict, List, Union
 
 import attr
+
+from synapse.types import JsonDict
 
 from ._base import (
     Config,
@@ -22,7 +27,7 @@ from ._base import (
     RoutableShardedWorkerHandlingConfig,
     ShardedWorkerHandlingConfig,
 )
-from .server import ListenerConfig, parse_listener_def
+from .server import DIRECT_TCP_ERROR, ListenerConfig, parse_listener_def
 
 _FEDERATION_SENDER_WITH_SEND_FEDERATION_ENABLED_ERROR = """
 The send_federation config option must be disabled in the main
@@ -38,6 +43,13 @@ synapse process before they can be run in a separate worker.
 Please add ``start_pushers: false`` to the main config
 """
 
+_DEPRECATED_WORKER_DUTY_OPTION_USED = """
+The '%s' configuration option is deprecated and will be removed in a future
+Synapse version. Please use ``%s: name_of_worker`` instead.
+"""
+
+logger = logging.getLogger(__name__)
+
 
 def _instance_to_list_converter(obj: Union[str, List[str]]) -> List[str]:
     """Helper for allowing parsing a string or list of strings to a config
@@ -49,12 +61,12 @@ def _instance_to_list_converter(obj: Union[str, List[str]]) -> List[str]:
     return obj
 
 
-@attr.s
+@attr.s(auto_attribs=True)
 class InstanceLocationConfig:
     """The host and port to talk to an instance via HTTP replication."""
 
-    host = attr.ib(type=str)
-    port = attr.ib(type=int)
+    host: str
+    port: int
 
 
 @attr.s
@@ -63,7 +75,8 @@ class WriterLocations:
 
     Attributes:
         events: The instances that write to the event and backfill streams.
-        typing: The instance that writes to the typing stream.
+        typing: The instances that write to the typing stream. Currently
+            can only be a single instance.
         to_device: The instances that write to the to_device stream. Currently
             can only be a single instance.
         account_data: The instances that write to the account data streams. Currently
@@ -74,28 +87,28 @@ class WriterLocations:
             can only be a single instance.
     """
 
-    events = attr.ib(
-        default=["master"], type=List[str], converter=_instance_to_list_converter
-    )
-    typing = attr.ib(default="master", type=str)
-    to_device = attr.ib(
+    events: List[str] = attr.ib(
         default=["master"],
-        type=List[str],
         converter=_instance_to_list_converter,
     )
-    account_data = attr.ib(
+    typing: List[str] = attr.ib(
         default=["master"],
-        type=List[str],
         converter=_instance_to_list_converter,
     )
-    receipts = attr.ib(
+    to_device: List[str] = attr.ib(
         default=["master"],
-        type=List[str],
         converter=_instance_to_list_converter,
     )
-    presence = attr.ib(
+    account_data: List[str] = attr.ib(
         default=["master"],
-        type=List[str],
+        converter=_instance_to_list_converter,
+    )
+    receipts: List[str] = attr.ib(
+        default=["master"],
+        converter=_instance_to_list_converter,
+    )
+    presence: List[str] = attr.ib(
+        default=["master"],
         converter=_instance_to_list_converter,
     )
 
@@ -107,7 +120,7 @@ class WorkerConfig(Config):
 
     section = "worker"
 
-    def read_config(self, config, **kwargs):
+    def read_config(self, config: JsonDict, **kwargs: Any) -> None:
         self.worker_app = config.get("worker_app")
 
         # Canonicalise worker_app so that master always has None
@@ -115,17 +128,23 @@ class WorkerConfig(Config):
             self.worker_app = None
 
         self.worker_listeners = [
-            parse_listener_def(x) for x in config.get("worker_listeners", [])
+            parse_listener_def(i, x)
+            for i, x in enumerate(config.get("worker_listeners", []))
         ]
-        self.worker_daemonize = config.get("worker_daemonize")
+        self.worker_daemonize = bool(config.get("worker_daemonize"))
         self.worker_pid_file = config.get("worker_pid_file")
-        self.worker_log_config = config.get("worker_log_config")
+
+        worker_log_config = config.get("worker_log_config")
+        if worker_log_config is not None and not isinstance(worker_log_config, str):
+            raise ConfigError("worker_log_config must be a string")
+        self.worker_log_config = worker_log_config
 
         # The host used to connect to the main synapse
         self.worker_replication_host = config.get("worker_replication_host", None)
 
         # The port on the main synapse for TCP replication
-        self.worker_replication_port = config.get("worker_replication_port", None)
+        if "worker_replication_port" in config:
+            raise ConfigError(DIRECT_TCP_ERROR, ("worker_replication_port",))
 
         # The port on the main synapse for HTTP replication endpoint
         self.worker_replication_http_port = config.get("worker_replication_http_port")
@@ -217,6 +236,11 @@ class WorkerConfig(Config):
                         % (instance, stream)
                     )
 
+        if len(self.writers.typing) != 1:
+            raise ConfigError(
+                "Must only specify one instance to handle `typing` messages."
+            )
+
         if len(self.writers.to_device) != 1:
             raise ConfigError(
                 "Must only specify one instance to handle `to_device` messages."
@@ -282,56 +306,113 @@ class WorkerConfig(Config):
             self.worker_name is None and background_tasks_instance == "master"
         ) or self.worker_name == background_tasks_instance
 
-    def generate_config_section(self, config_dir_path, server_name, **kwargs):
-        return """\
-        ## Workers ##
+        self.should_notify_appservices = self._should_this_worker_perform_duty(
+            config,
+            legacy_master_option_name="notify_appservices",
+            legacy_worker_app_name="synapse.app.appservice",
+            new_option_name="notify_appservices_from_worker",
+        )
 
-        # Disables sending of outbound federation transactions on the main process.
-        # Uncomment if using a federation sender worker.
-        #
-        #send_federation: false
+        self.should_update_user_directory = self._should_this_worker_perform_duty(
+            config,
+            legacy_master_option_name="update_user_directory",
+            legacy_worker_app_name="synapse.app.user_dir",
+            new_option_name="update_user_directory_from_worker",
+        )
 
-        # It is possible to run multiple federation sender workers, in which case the
-        # work is balanced across them.
-        #
-        # This configuration must be shared between all federation sender workers, and if
-        # changed all federation sender workers must be stopped at the same time and then
-        # started, to ensure that all instances are running with the same config (otherwise
-        # events may be dropped).
-        #
-        #federation_sender_instances:
-        #  - federation_sender1
+    def _should_this_worker_perform_duty(
+        self,
+        config: Dict[str, Any],
+        legacy_master_option_name: str,
+        legacy_worker_app_name: str,
+        new_option_name: str,
+    ) -> bool:
+        """
+        Figures out whether this worker should perform a certain duty.
 
-        # When using workers this should be a map from `worker_name` to the
-        # HTTP replication listener of the worker, if configured.
-        #
-        #instance_map:
-        #  worker1:
-        #    host: localhost
-        #    port: 8034
+        This function is temporary and is only to deal with the complexity
+        of allowing old, transitional and new configurations all at once.
 
-        # Experimental: When using workers you can define which workers should
-        # handle event persistence and typing notifications. Any worker
-        # specified here must also be in the `instance_map`.
-        #
-        #stream_writers:
-        #  events: worker1
-        #  typing: worker1
+        Contradictions between the legacy and new part of a transitional configuration
+        will lead to a ConfigError.
 
-        # The worker that is used to run background tasks (e.g. cleaning up expired
-        # data). If not provided this defaults to the main process.
-        #
-        #run_background_tasks_on: worker1
-
-        # A shared secret used by the replication APIs to authenticate HTTP requests
-        # from workers.
-        #
-        # By default this is unused and traffic is not authenticated.
-        #
-        #worker_replication_secret: ""
+        Parameters:
+            config: The config dictionary
+            legacy_master_option_name: The name of a legacy option, whose value is boolean,
+                specifying whether it's the master that should handle a certain duty.
+                e.g. "notify_appservices"
+            legacy_worker_app_name: The name of a legacy Synapse worker application
+                that would traditionally perform this duty.
+                e.g. "synapse.app.appservice"
+            new_option_name: The name of the new option, whose value is the name of a
+                designated worker to perform the duty.
+                e.g. "notify_appservices_from_worker"
         """
 
-    def read_arguments(self, args):
+        # None means 'unspecified'; True means 'run here' and False means
+        # 'don't run here'.
+        new_option_should_run_here = None
+        if new_option_name in config:
+            designated_worker = config[new_option_name] or "master"
+            new_option_should_run_here = (
+                designated_worker == "master" and self.worker_name is None
+            ) or designated_worker == self.worker_name
+
+        legacy_option_should_run_here = None
+        if legacy_master_option_name in config:
+            run_on_master = bool(config[legacy_master_option_name])
+
+            legacy_option_should_run_here = (
+                self.worker_name is None and run_on_master
+            ) or (self.worker_app == legacy_worker_app_name and not run_on_master)
+
+            # Suggest using the new option instead.
+            logger.warning(
+                _DEPRECATED_WORKER_DUTY_OPTION_USED,
+                legacy_master_option_name,
+                new_option_name,
+            )
+
+        if self.worker_app == legacy_worker_app_name and config.get(
+            legacy_master_option_name, True
+        ):
+            # As an extra bit of complication, we need to check that the
+            # specialised worker is only used if the legacy config says the
+            # master isn't performing the duties.
+            raise ConfigError(
+                f"Cannot use deprecated worker app type '{legacy_worker_app_name}' whilst deprecated option '{legacy_master_option_name}' is not set to false.\n"
+                f"Consider setting `worker_app: synapse.app.generic_worker` and using the '{new_option_name}' option instead.\n"
+                f"The '{new_option_name}' option replaces '{legacy_master_option_name}'."
+            )
+
+        if new_option_should_run_here is None and legacy_option_should_run_here is None:
+            # Neither option specified; the fallback behaviour is to run on the main process
+            return self.worker_name is None
+
+        if (
+            new_option_should_run_here is not None
+            and legacy_option_should_run_here is not None
+        ):
+            # Both options specified; ensure they match!
+            if new_option_should_run_here != legacy_option_should_run_here:
+                update_worker_type = (
+                    " and set worker_app: synapse.app.generic_worker"
+                    if self.worker_app == legacy_worker_app_name
+                    else ""
+                )
+                # If the values conflict, we suggest the admin removes the legacy option
+                # for simplicity.
+                raise ConfigError(
+                    f"Conflicting configuration options: {legacy_master_option_name} (legacy), {new_option_name} (new).\n"
+                    f"Suggestion: remove {legacy_master_option_name}{update_worker_type}.\n"
+                )
+
+        # We've already validated that these aren't conflicting; now just see if
+        # either is True.
+        # (By this point, these are either the same value or only one is not None.)
+        return bool(new_option_should_run_here or legacy_option_should_run_here)
+
+    def read_arguments(self, args: argparse.Namespace) -> None:
         # We support a bunch of command line arguments that override options in
         # the config. A lot of these options have a worker_* prefix when running
         # on workers so we also have to override them when command line options

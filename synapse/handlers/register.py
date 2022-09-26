@@ -1,4 +1,5 @@
 # Copyright 2014 - 2016 OpenMarket Ltd
+# Copyright 2021 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,7 +29,13 @@ from synapse.api.constants import (
     JoinRules,
     LoginType,
 )
-from synapse.api.errors import AuthError, Codes, ConsentNotGivenError, SynapseError
+from synapse.api.errors import (
+    AuthError,
+    Codes,
+    ConsentNotGivenError,
+    InvalidClientTokenError,
+    SynapseError,
+)
 from synapse.appservice import ApplicationService
 from synapse.config.server import is_threepid_reserved
 from synapse.http.servlet import assert_params_in_dict
@@ -85,10 +92,12 @@ class LoginDict(TypedDict):
 
 class RegistrationHandler:
     def __init__(self, hs: "HomeServer"):
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
+        self._storage_controllers = hs.get_storage_controllers()
         self.clock = hs.get_clock()
         self.hs = hs
         self.auth = hs.get_auth()
+        self.auth_blocking = hs.get_auth_blocking()
         self._auth_handler = hs.get_auth_handler()
         self.profile_handler = hs.get_profile_handler()
         self.user_directory_handler = hs.get_user_directory_handler()
@@ -116,7 +125,13 @@ class RegistrationHandler:
             self.pusher_pool = hs.get_pusherpool()
 
         self.session_lifetime = hs.config.registration.session_lifetime
-        self.access_token_lifetime = hs.config.registration.access_token_lifetime
+        self.nonrefreshable_access_token_lifetime = (
+            hs.config.registration.nonrefreshable_access_token_lifetime
+        )
+        self.refreshable_access_token_lifetime = (
+            hs.config.registration.refreshable_access_token_lifetime
+        )
+        self.refresh_token_lifetime = hs.config.registration.refresh_token_lifetime
 
         init_counters_for_auth_provider("")
 
@@ -125,6 +140,7 @@ class RegistrationHandler:
         localpart: str,
         guest_access_token: Optional[str] = None,
         assigned_user_id: Optional[str] = None,
+        inhibit_user_in_use_error: bool = False,
     ) -> None:
         if types.contains_invalid_mxid_characters(localpart):
             raise SynapseError(
@@ -164,21 +180,19 @@ class RegistrationHandler:
 
         users = await self.store.get_users_by_id_case_insensitive(user_id)
         if users:
-            if not guest_access_token:
+            if not inhibit_user_in_use_error and not guest_access_token:
                 raise SynapseError(
                     400, "User ID already taken.", errcode=Codes.USER_IN_USE
                 )
-            user_data = await self.auth.get_user_by_access_token(guest_access_token)
-            if (
-                not user_data.is_guest
-                or UserID.from_string(user_data.user_id).localpart != localpart
-            ):
-                raise AuthError(
-                    403,
-                    "Cannot register taken user ID without valid guest "
-                    "credentials for that user.",
-                    errcode=Codes.FORBIDDEN,
-                )
+            if guest_access_token:
+                user_data = await self.auth.get_user_by_access_token(guest_access_token)
+                if not user_data.is_guest or user_data.user.localpart != localpart:
+                    raise AuthError(
+                        403,
+                        "Cannot register taken user ID without valid guest "
+                        "credentials for that user.",
+                        errcode=Codes.FORBIDDEN,
+                    )
 
         if guest_access_token is None:
             try:
@@ -266,7 +280,7 @@ class RegistrationHandler:
 
         # do not check_auth_blocking if the call is coming through the Admin API
         if not by_admin:
-            await self.auth.check_auth_blocking(threepid=threepid)
+            await self.auth_blocking.check_auth_blocking(threepid=threepid)
 
         if localpart is not None:
             await self.check_username(localpart, guest_access_token=guest_access_token)
@@ -311,12 +325,12 @@ class RegistrationHandler:
                 if fail_count > 10:
                     raise SynapseError(500, "Unable to find a suitable guest user ID")
 
-                localpart = await self.store.generate_user_id()
-                user = UserID(localpart, self.hs.hostname)
+                generated_localpart = await self.store.generate_user_id()
+                user = UserID(generated_localpart, self.hs.hostname)
                 user_id = user.to_string()
                 self.check_user_id_not_appservice_exclusive(user_id)
                 if generate_display_name:
-                    default_display_name = localpart
+                    default_display_name = generated_localpart
                 try:
                     await self.register_with_store(
                         user_id=user_id,
@@ -519,7 +533,7 @@ class RegistrationHandler:
 
                 if requires_invite:
                     # If the server is in the room, check if the room is public.
-                    state = await self.store.get_filtered_current_state_ids(
+                    state = await self._storage_controllers.state.get_current_state_ids(
                         room_id, StateFilter.from_types([(EventTypes.JoinRules, "")])
                     )
 
@@ -607,7 +621,7 @@ class RegistrationHandler:
         user_id = user.to_string()
         service = self.store.get_app_service_by_token(as_token)
         if not service:
-            raise AuthError(403, "Invalid application service token.")
+            raise InvalidClientTokenError()
         if not service.is_interested_in_user(user_id):
             raise SynapseError(
                 400,
@@ -739,6 +753,7 @@ class RegistrationHandler:
         is_appservice_ghost: bool = False,
         auth_provider_id: Optional[str] = None,
         should_issue_refresh_token: bool = False,
+        auth_provider_session_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[int], Optional[str]]:
         """Register a device for a user and generate an access token.
 
@@ -749,9 +764,9 @@ class RegistrationHandler:
             device_id: The device ID to check, or None to generate a new one.
             initial_display_name: An optional display name for the device.
             is_guest: Whether this is a guest account
-            auth_provider_id: The SSO IdP the user used, if any (just used for the
-                prometheus metrics).
+            auth_provider_id: The SSO IdP the user used, if any.
             should_issue_refresh_token: Whether it should also issue a refresh token
+            auth_provider_session_id: The session ID received during login from the SSO IdP.
         Returns:
             Tuple of device ID, access token, access token expiration time and refresh token
         """
@@ -762,6 +777,8 @@ class RegistrationHandler:
             is_guest=is_guest,
             is_appservice_ghost=is_appservice_ghost,
             should_issue_refresh_token=should_issue_refresh_token,
+            auth_provider_id=auth_provider_id,
+            auth_provider_session_id=auth_provider_session_id,
         )
 
         login_counter.labels(
@@ -784,6 +801,8 @@ class RegistrationHandler:
         is_guest: bool = False,
         is_appservice_ghost: bool = False,
         should_issue_refresh_token: bool = False,
+        auth_provider_id: Optional[str] = None,
+        auth_provider_session_id: Optional[str] = None,
     ) -> LoginDict:
         """Helper for register_device
 
@@ -791,38 +810,86 @@ class RegistrationHandler:
         class and RegisterDeviceReplicationServlet.
         """
         assert not self.hs.config.worker.worker_app
-        valid_until_ms = None
+        now_ms = self.clock.time_msec()
+        access_token_expiry = None
         if self.session_lifetime is not None:
             if is_guest:
                 raise Exception(
                     "session_lifetime is not currently implemented for guest access"
                 )
-            valid_until_ms = self.clock.time_msec() + self.session_lifetime
+            access_token_expiry = now_ms + self.session_lifetime
+
+        if self.nonrefreshable_access_token_lifetime is not None:
+            if access_token_expiry is not None:
+                # Don't allow the non-refreshable access token to outlive the
+                # session.
+                access_token_expiry = min(
+                    now_ms + self.nonrefreshable_access_token_lifetime,
+                    access_token_expiry,
+                )
+            else:
+                access_token_expiry = now_ms + self.nonrefreshable_access_token_lifetime
 
         refresh_token = None
         refresh_token_id = None
 
         registered_device_id = await self.device_handler.check_device_registered(
-            user_id, device_id, initial_display_name
+            user_id,
+            device_id,
+            initial_display_name,
+            auth_provider_id=auth_provider_id,
+            auth_provider_session_id=auth_provider_session_id,
         )
         if is_guest:
-            assert valid_until_ms is None
+            assert access_token_expiry is None
             access_token = self.macaroon_gen.generate_guest_access_token(user_id)
         else:
             if should_issue_refresh_token:
+                # A refreshable access token lifetime must be configured
+                # since we're told to issue a refresh token (the caller checks
+                # that this value is set before setting this flag).
+                assert self.refreshable_access_token_lifetime is not None
+
+                # Set the expiry time of the refreshable access token
+                access_token_expiry = now_ms + self.refreshable_access_token_lifetime
+
+                # Set the refresh token expiry time (if configured)
+                refresh_token_expiry = None
+                if self.refresh_token_lifetime is not None:
+                    refresh_token_expiry = now_ms + self.refresh_token_lifetime
+
+                # Set an ultimate session expiry time (if configured)
+                ultimate_session_expiry_ts = None
+                if self.session_lifetime is not None:
+                    ultimate_session_expiry_ts = now_ms + self.session_lifetime
+
+                    # Also ensure that the issued tokens don't outlive the
+                    # session.
+                    # (It would be weird to configure a homeserver with a shorter
+                    # session lifetime than token lifetime, but may as well handle
+                    # it.)
+                    access_token_expiry = min(
+                        access_token_expiry, ultimate_session_expiry_ts
+                    )
+                    if refresh_token_expiry is not None:
+                        refresh_token_expiry = min(
+                            refresh_token_expiry, ultimate_session_expiry_ts
+                        )
+
                 (
                     refresh_token,
                     refresh_token_id,
-                ) = await self._auth_handler.get_refresh_token_for_user_id(
+                ) = await self._auth_handler.create_refresh_token_for_user_id(
                     user_id,
                     device_id=registered_device_id,
+                    expiry_ts=refresh_token_expiry,
+                    ultimate_session_expiry_ts=ultimate_session_expiry_ts,
                 )
-                valid_until_ms = self.clock.time_msec() + self.access_token_lifetime
 
-            access_token = await self._auth_handler.get_access_token_for_user_id(
+            access_token = await self._auth_handler.create_access_token_for_user_id(
                 user_id,
                 device_id=registered_device_id,
-                valid_until_ms=valid_until_ms,
+                valid_until_ms=access_token_expiry,
                 is_appservice_ghost=is_appservice_ghost,
                 refresh_token_id=refresh_token_id,
             )
@@ -830,7 +897,7 @@ class RegistrationHandler:
         return {
             "device_id": registered_device_id,
             "access_token": access_token,
-            "valid_until_ms": valid_until_ms,
+            "valid_until_ms": access_token_expiry,
             "refresh_token": refresh_token,
         }
 
@@ -930,7 +997,7 @@ class RegistrationHandler:
             assert user_tuple
             token_id = user_tuple.token_id
 
-            await self.pusher_pool.add_pusher(
+            await self.pusher_pool.add_or_update_pusher(
                 user_id=user_id,
                 access_token=token_id,
                 kind="email",
@@ -938,7 +1005,7 @@ class RegistrationHandler:
                 app_display_name="Email Notifications",
                 device_display_name=threepid["address"],
                 pushkey=threepid["address"],
-                lang=None,  # We don't know a user's language here
+                lang=None,
                 data={},
             )
 

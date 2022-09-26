@@ -17,6 +17,7 @@ import logging
 from typing import TYPE_CHECKING, Tuple
 
 from synapse.api import errors
+from synapse.api.errors import NotFoundError
 from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
@@ -24,9 +25,8 @@ from synapse.http.servlet import (
     parse_json_object_from_request,
 )
 from synapse.http.site import SynapseRequest
+from synapse.rest.client._base import client_patterns, interactive_auth_handler
 from synapse.types import JsonDict
-
-from ._base import client_patterns, interactive_auth_handler
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -42,12 +42,26 @@ class DevicesRestServlet(RestServlet):
         self.hs = hs
         self.auth = hs.get_auth()
         self.device_handler = hs.get_device_handler()
+        self._msc3852_enabled = hs.config.experimental.msc3852_enabled
 
     async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         devices = await self.device_handler.get_devices_by_user(
             requester.user.to_string()
         )
+
+        # If MSC3852 is disabled, then the "last_seen_user_agent" field will be
+        # removed from each device. If it is enabled, then the field name will
+        # be replaced by the unstable identifier.
+        #
+        # When MSC3852 is accepted, this block of code can just be removed to
+        # expose "last_seen_user_agent" to clients.
+        for device in devices:
+            last_seen_user_agent = device["last_seen_user_agent"]
+            del device["last_seen_user_agent"]
+            if self._msc3852_enabled:
+                device["org.matrix.msc3852.last_seen_user_agent"] = last_seen_user_agent
+
         return 200, {"devices": devices}
 
 
@@ -108,6 +122,7 @@ class DeviceRestServlet(RestServlet):
         self.auth = hs.get_auth()
         self.device_handler = hs.get_device_handler()
         self.auth_handler = hs.get_auth_handler()
+        self._msc3852_enabled = hs.config.experimental.msc3852_enabled
 
     async def on_GET(
         self, request: SynapseRequest, device_id: str
@@ -116,6 +131,20 @@ class DeviceRestServlet(RestServlet):
         device = await self.device_handler.get_device(
             requester.user.to_string(), device_id
         )
+        if device is None:
+            raise NotFoundError("No device found")
+
+        # If MSC3852 is disabled, then the "last_seen_user_agent" field will be
+        # removed from each device. If it is enabled, then the field name will
+        # be replaced by the unstable identifier.
+        #
+        # When MSC3852 is accepted, this block of code can just be removed to
+        # expose "last_seen_user_agent" to clients.
+        last_seen_user_agent = device["last_seen_user_agent"]
+        del device["last_seen_user_agent"]
+        if self._msc3852_enabled:
+            device["org.matrix.msc3852.last_seen_user_agent"] = last_seen_user_agent
+
         return 200, device
 
     @interactive_auth_handler
@@ -145,7 +174,9 @@ class DeviceRestServlet(RestServlet):
             can_skip_ui_auth=True,
         )
 
-        await self.device_handler.delete_device(requester.user.to_string(), device_id)
+        await self.device_handler.delete_devices(
+            requester.user.to_string(), [device_id]
+        )
         return 200, {}
 
     async def on_PUT(

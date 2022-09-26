@@ -16,26 +16,44 @@ import atexit
 import gc
 import logging
 import os
-import platform
 import signal
 import socket
 import sys
 import traceback
 import warnings
-from typing import TYPE_CHECKING, Awaitable, Callable, Iterable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Collection,
+    Dict,
+    Iterable,
+    List,
+    NoReturn,
+    Optional,
+    Tuple,
+    cast,
+)
 
 from cryptography.utils import CryptographyDeprecationWarning
-from typing_extensions import NoReturn
+from typing_extensions import ParamSpec
 
 import twisted
-from twisted.internet import defer, error, reactor
+from twisted.internet import defer, error, reactor as _reactor
+from twisted.internet.interfaces import IOpenSSLContextFactory, IReactorSSL, IReactorTCP
+from twisted.internet.protocol import ServerFactory
+from twisted.internet.tcp import Port
 from twisted.logger import LoggingFile, LogLevel
 from twisted.protocols.tls import TLSMemoryBIOFactory
+from twisted.python.threadpool import ThreadPool
 
-import synapse
+import synapse.util.caches
 from synapse.api.constants import MAX_PDU_SIZE
 from synapse.app import check_bind_error
 from synapse.app.phone_stats_home import start_phone_stats_home
+from synapse.config import ConfigError
+from synapse.config._base import format_config_error
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import ManholeConfig
 from synapse.crypto import context_factory
@@ -44,43 +62,63 @@ from synapse.events.spamcheck import load_legacy_spam_checkers
 from synapse.events.third_party_rules import load_legacy_third_party_event_rules
 from synapse.handlers.auth import load_legacy_password_auth_providers
 from synapse.logging.context import PreserveLoggingContext
+from synapse.logging.opentracing import init_tracer
+from synapse.metrics import install_gc_manager, register_threadpool
 from synapse.metrics.background_process_metrics import wrap_as_background_process
 from synapse.metrics.jemalloc import setup_jemalloc_stats
+from synapse.types import ISynapseReactor
+from synapse.util import SYNAPSE_VERSION
 from synapse.util.caches.lrucache import setup_expire_lru_cache_entries
 from synapse.util.daemonize import daemonize_process
+from synapse.util.gai_resolver import GAIResolver
 from synapse.util.rlimit import change_resource_limit
-from synapse.util.versionstring import get_version_string
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
+# Twisted injects the global reactor to make it easier to import, this confuses
+# mypy which thinks it is a module. Tell it that it a more proper type.
+reactor = cast(ISynapseReactor, _reactor)
+
+
 logger = logging.getLogger(__name__)
 
 # list of tuples of function, args list, kwargs dict
-_sighup_callbacks = []
+_sighup_callbacks: List[
+    Tuple[Callable[..., None], Tuple[object, ...], Dict[str, object]]
+] = []
+P = ParamSpec("P")
 
 
-def register_sighup(func, *args, **kwargs):
+def register_sighup(func: Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None:
     """
     Register a function to be called when a SIGHUP occurs.
 
     Args:
-        func (function): Function to be called when sent a SIGHUP signal.
+        func: Function to be called when sent a SIGHUP signal.
         *args, **kwargs: args and kwargs to be passed to the target function.
     """
-    _sighup_callbacks.append((func, args, kwargs))
+    # This type-ignore should be redundant once we use a mypy release with
+    # https://github.com/python/mypy/pull/12668.
+    _sighup_callbacks.append((func, args, kwargs))  # type: ignore[arg-type]
 
 
-def start_worker_reactor(appname, config, run_command=reactor.run):
+def start_worker_reactor(
+    appname: str,
+    config: HomeServerConfig,
+    # Use a lambda to avoid binding to a given reactor at import time.
+    # (needed when synapse.app.complement_fork_starter is being used)
+    run_command: Callable[[], None] = lambda: reactor.run(),
+) -> None:
     """Run the reactor in the main process
 
     Daemonizes if necessary, and then configures some resources, before starting
     the reactor. Pulls configuration from the 'worker' settings in 'config'.
 
     Args:
-        appname (str): application name which will be sent to syslog
-        config (synapse.config.Config): config object
-        run_command (Callable[]): callable that actually runs the reactor
+        appname: application name which will be sent to syslog
+        config: config object
+        run_command: callable that actually runs the reactor
     """
 
     logger = logging.getLogger(config.worker.worker_app)
@@ -98,37 +136,40 @@ def start_worker_reactor(appname, config, run_command=reactor.run):
 
 
 def start_reactor(
-    appname,
-    soft_file_limit,
-    gc_thresholds,
-    pid_file,
-    daemonize,
-    print_pidfile,
-    logger,
-    run_command=reactor.run,
-):
+    appname: str,
+    soft_file_limit: int,
+    gc_thresholds: Optional[Tuple[int, int, int]],
+    pid_file: Optional[str],
+    daemonize: bool,
+    print_pidfile: bool,
+    logger: logging.Logger,
+    # Use a lambda to avoid binding to a given reactor at import time.
+    # (needed when synapse.app.complement_fork_starter is being used)
+    run_command: Callable[[], None] = lambda: reactor.run(),
+) -> None:
     """Run the reactor in the main process
 
     Daemonizes if necessary, and then configures some resources, before starting
     the reactor
 
     Args:
-        appname (str): application name which will be sent to syslog
-        soft_file_limit (int):
+        appname: application name which will be sent to syslog
+        soft_file_limit:
         gc_thresholds:
-        pid_file (str): name of pid file to write to if daemonize is True
-        daemonize (bool): true to run the reactor in a background process
-        print_pidfile (bool): whether to print the pid file, if daemonize is True
-        logger (logging.Logger): logger instance to pass to Daemonize
-        run_command (Callable[]): callable that actually runs the reactor
+        pid_file: name of pid file to write to if daemonize is True
+        daemonize: true to run the reactor in a background process
+        print_pidfile: whether to print the pid file, if daemonize is True
+        logger: logger instance to pass to Daemonize
+        run_command: callable that actually runs the reactor
     """
 
-    def run():
+    def run() -> None:
         logger.info("Running")
         setup_jemalloc_stats()
         change_resource_limit(soft_file_limit)
         if gc_thresholds:
             gc.set_threshold(*gc_thresholds)
+        install_gc_manager()
         run_command()
 
     # make sure that we run the reactor with the sentinel log context,
@@ -141,6 +182,8 @@ def start_reactor(
     # appearing to go backwards.
     with PreserveLoggingContext():
         if daemonize:
+            assert pid_file is not None
+
             if print_pidfile:
                 print(pid_file)
 
@@ -182,7 +225,9 @@ def redirect_stdio_to_logs() -> None:
     print("Redirected stdout/stderr to logs")
 
 
-def register_start(cb: Callable[..., Awaitable], *args, **kwargs) -> None:
+def register_start(
+    cb: Callable[P, Awaitable], *args: P.args, **kwargs: P.kwargs
+) -> None:
     """Register a callback with the reactor, to be called once it is running
 
     This can be used to initialise parts of the system which require an asynchronous
@@ -192,7 +237,7 @@ def register_start(cb: Callable[..., Awaitable], *args, **kwargs) -> None:
     will exit.
     """
 
-    async def wrapper():
+    async def wrapper() -> None:
         try:
             await cb(*args, **kwargs)
         except Exception:
@@ -221,23 +266,56 @@ def register_start(cb: Callable[..., Awaitable], *args, **kwargs) -> None:
     reactor.callWhenRunning(lambda: defer.ensureDeferred(wrapper()))
 
 
-def listen_metrics(bind_addresses, port):
+def listen_metrics(
+    bind_addresses: Iterable[str], port: int, enable_legacy_metric_names: bool
+) -> None:
     """
     Start Prometheus metrics server.
     """
-    from synapse.metrics import RegistryProxy, start_http_server
+    from prometheus_client import start_http_server as start_http_server_prometheus
+
+    from synapse.metrics import (
+        RegistryProxy,
+        start_http_server as start_http_server_legacy,
+    )
 
     for host in bind_addresses:
         logger.info("Starting metrics listener on %s:%d", host, port)
-        start_http_server(port, addr=host, registry=RegistryProxy)
+        if enable_legacy_metric_names:
+            start_http_server_legacy(port, addr=host, registry=RegistryProxy)
+        else:
+            _set_prometheus_client_use_created_metrics(False)
+            start_http_server_prometheus(port, addr=host, registry=RegistryProxy)
+
+
+def _set_prometheus_client_use_created_metrics(new_value: bool) -> None:
+    """
+    Sets whether prometheus_client should expose `_created`-suffixed metrics for
+    all gauges, histograms and summaries.
+    There is no programmatic way to disable this without poking at internals;
+    the proper way is to use an environment variable which prometheus_client
+    loads at import time.
+
+    The motivation for disabling these `_created` metrics is that they're
+    a waste of space as they're not useful but they take up space in Prometheus.
+    """
+
+    import prometheus_client.metrics
+
+    if hasattr(prometheus_client.metrics, "_use_created"):
+        prometheus_client.metrics._use_created = new_value
+    else:
+        logger.error(
+            "Can't disable `_created` metrics in prometheus_client (brittle hack broken?)"
+        )
 
 
 def listen_manhole(
-    bind_addresses: Iterable[str],
+    bind_addresses: Collection[str],
     port: int,
     manhole_settings: ManholeConfig,
     manhole_globals: dict,
-):
+) -> None:
     # twisted.conch.manhole 21.1.0 uses "int_from_bytes", which produces a confusing
     # warning. It's fixed by https://github.com/twisted/twisted/pull/1522), so
     # suppress the warning for now.
@@ -256,12 +334,18 @@ def listen_manhole(
     )
 
 
-def listen_tcp(bind_addresses, port, factory, reactor=reactor, backlog=50):
+def listen_tcp(
+    bind_addresses: Collection[str],
+    port: int,
+    factory: ServerFactory,
+    reactor: IReactorTCP = reactor,
+    backlog: int = 50,
+) -> List[Port]:
     """
     Create a TCP socket for a port and several addresses
 
     Returns:
-        list[twisted.internet.tcp.Port]: listening for TCP connections
+        list of twisted.internet.tcp.Port listening for TCP connections
     """
     r = []
     for address in bind_addresses:
@@ -270,12 +354,19 @@ def listen_tcp(bind_addresses, port, factory, reactor=reactor, backlog=50):
         except error.CannotListenError as e:
             check_bind_error(e, address, bind_addresses)
 
-    return r
+    # IReactorTCP returns an object implementing IListeningPort from listenTCP,
+    # but we know it will be a Port instance.
+    return r  # type: ignore[return-value]
 
 
 def listen_ssl(
-    bind_addresses, port, factory, context_factory, reactor=reactor, backlog=50
-):
+    bind_addresses: Collection[str],
+    port: int,
+    factory: ServerFactory,
+    context_factory: IOpenSSLContextFactory,
+    reactor: IReactorSSL = reactor,
+    backlog: int = 50,
+) -> List[Port]:
     """
     Create an TLS-over-TCP socket for a port and several addresses
 
@@ -291,10 +382,13 @@ def listen_ssl(
         except error.CannotListenError as e:
             check_bind_error(e, address, bind_addresses)
 
-    return r
+    # IReactorSSL incorrectly declares that an int is returned from listenSSL,
+    # it actually returns an object implementing IListeningPort, but we know it
+    # will be a Port instance.
+    return r  # type: ignore[return-value]
 
 
-def refresh_certificate(hs: "HomeServer"):
+def refresh_certificate(hs: "HomeServer") -> None:
     """
     Refresh the TLS certificates that Synapse is using by re-reading them from
     disk and updating the TLS context factories to use them.
@@ -326,7 +420,7 @@ def refresh_certificate(hs: "HomeServer"):
         logger.info("Context factories updated.")
 
 
-async def start(hs: "HomeServer"):
+async def start(hs: "HomeServer") -> None:
     """
     Start a Synapse server or worker.
 
@@ -338,12 +432,26 @@ async def start(hs: "HomeServer"):
     Args:
         hs: homeserver instance
     """
+    reactor = hs.get_reactor()
+
+    # We want to use a separate thread pool for the resolver so that large
+    # numbers of DNS requests don't starve out other users of the threadpool.
+    resolver_threadpool = ThreadPool(name="gai_resolver")
+    resolver_threadpool.start()
+    reactor.addSystemEventTrigger("during", "shutdown", resolver_threadpool.stop)
+    reactor.installNameResolver(
+        GAIResolver(reactor, getThreadPool=lambda: resolver_threadpool)
+    )
+
+    # Register the threadpools with our metrics.
+    register_threadpool("default", reactor.getThreadPool())
+    register_threadpool("gai_resolver", resolver_threadpool)
+
     # Set up the SIGHUP machinery.
     if hasattr(signal, "SIGHUP"):
-        reactor = hs.get_reactor()
 
         @wrap_as_background_process("sighup")
-        def handle_sighup(*args, **kwargs):
+        async def handle_sighup(*args: Any, **kwargs: Any) -> None:
             # Tell systemd our state, if we're using it. This will silently fail if
             # we're not using systemd.
             sdnotify(b"RELOADING=1")
@@ -356,7 +464,7 @@ async def start(hs: "HomeServer"):
         # We defer running the sighup handlers until next reactor tick. This
         # is so that we're in a sane state, e.g. flushing the logs may fail
         # if the sighup happens in the middle of writing a log entry.
-        def run_sighup(*args, **kwargs):
+        def run_sighup(*args: Any, **kwargs: Any) -> None:
             # `callFromThread` should be "signal safe" as well as thread
             # safe.
             reactor.callFromThread(handle_sighup, *args, **kwargs)
@@ -364,18 +472,23 @@ async def start(hs: "HomeServer"):
         signal.signal(signal.SIGHUP, run_sighup)
 
         register_sighup(refresh_certificate, hs)
+        register_sighup(reload_cache_config, hs.config)
+
+    # Apply the cache config.
+    hs.config.caches.resize_all_caches()
 
     # Load the certificate from disk.
     refresh_certificate(hs)
 
     # Start the tracer
-    synapse.logging.opentracing.init_tracer(hs)  # type: ignore[attr-defined] # noqa
+    init_tracer(hs)  # noqa
 
     # Instantiate the modules so they can register their web resources to the module API
     # before we start the listeners.
     module_api = hs.get_module_api()
     for module, config in hs.config.modules.loaded_modules:
-        module(config=config, api=module_api)
+        m = module(config, module_api)
+        logger.info("Loaded module %s", m)
 
     load_legacy_spam_checkers(hs)
     load_legacy_third_party_event_rules(hs)
@@ -387,7 +500,7 @@ async def start(hs: "HomeServer"):
 
     # It is now safe to start your Synapse.
     hs.start_listening()
-    hs.get_datastore().db_pool.start_profiling()
+    hs.get_datastores().main.db_pool.start_profiling()
     hs.get_pusherpool().start()
 
     # Log when we start the shut down process.
@@ -398,33 +511,65 @@ async def start(hs: "HomeServer"):
     setup_sentry(hs)
     setup_sdnotify(hs)
 
-    # If background tasks are running on the main process, start collecting the
-    # phone home stats.
+    # If background tasks are running on the main process or this is the worker in
+    # charge of them, start collecting the phone home stats and shared usage metrics.
     if hs.config.worker.run_background_tasks:
+        await hs.get_common_usage_metrics_manager().setup()
         start_phone_stats_home(hs)
 
     # We now freeze all allocated objects in the hopes that (almost)
     # everything currently allocated are things that will be used for the
     # rest of time. Doing so means less work each GC (hopefully).
     #
-    # This only works on Python 3.7
-    if platform.python_implementation() == "CPython" and sys.version_info >= (3, 7):
+    # PyPy does not (yet?) implement gc.freeze()
+    if hasattr(gc, "freeze"):
         gc.collect()
         gc.freeze()
 
-    # Speed up shutdowns by freezing all allocated objects. This moves everything
-    # into the permanent generation and excludes them from the final GC.
-    # Unfortunately only works on Python 3.7
-    if platform.python_implementation() == "CPython" and sys.version_info >= (3, 7):
+        # Speed up shutdowns by freezing all allocated objects. This moves everything
+        # into the permanent generation and excludes them from the final GC.
         atexit.register(gc.freeze)
 
 
-def setup_sentry(hs: "HomeServer"):
-    """Enable sentry integration, if enabled in configuration
+def reload_cache_config(config: HomeServerConfig) -> None:
+    """Reload cache config from disk and immediately apply it.resize caches accordingly.
 
-    Args:
-        hs
+    If the config is invalid, a `ConfigError` is logged and no changes are made.
+
+    Otherwise, this:
+        - replaces the `caches` section on the given `config` object,
+        - resizes all caches according to the new cache factors, and
+
+    Note that the following cache config keys are read, but not applied:
+        - event_cache_size: used to set a max_size and _original_max_size on
+              EventsWorkerStore._get_event_cache when it is created. We'd have to update
+              the _original_max_size (and maybe
+        - sync_response_cache_duration: would have to update the timeout_sec attribute on
+              HomeServer ->  SyncHandler -> ResponseCache.
+        - track_memory_usage. This affects synapse.util.caches.TRACK_MEMORY_USAGE which
+              influences Synapse's self-reported metrics.
+
+    Also, the HTTPConnectionPool in SimpleHTTPClient sets its maxPersistentPerHost
+    parameter based on the global_factor. This won't be applied on a config reload.
     """
+    try:
+        previous_cache_config = config.reload_config_section("caches")
+    except ConfigError as e:
+        logger.warning("Failed to reload cache config")
+        for f in format_config_error(e):
+            logger.warning(f)
+    else:
+        logger.debug(
+            "New cache config. Was:\n %s\nNow:\n",
+            previous_cache_config.__dict__,
+            config.caches.__dict__,
+        )
+        synapse.util.caches.TRACK_MEMORY_USAGE = config.caches.track_memory_usage
+        config.caches.resize_all_caches()
+
+
+def setup_sentry(hs: "HomeServer") -> None:
+    """Enable sentry integration, if enabled in configuration"""
 
     if not hs.config.metrics.sentry_enabled:
         return
@@ -432,7 +577,8 @@ def setup_sentry(hs: "HomeServer"):
     import sentry_sdk
 
     sentry_sdk.init(
-        dsn=hs.config.metrics.sentry_dsn, release=get_version_string(synapse)
+        dsn=hs.config.metrics.sentry_dsn,
+        release=SYNAPSE_VERSION,
     )
 
     # We set some default tags that give some context to this instance
@@ -449,7 +595,7 @@ def setup_sentry(hs: "HomeServer"):
         scope.set_tag("worker_name", name)
 
 
-def setup_sdnotify(hs: "HomeServer"):
+def setup_sdnotify(hs: "HomeServer") -> None:
     """Adds process state hooks to tell systemd what we are up to."""
 
     # Tell systemd our state, if we're using it. This will silently fail if
@@ -464,7 +610,7 @@ def setup_sdnotify(hs: "HomeServer"):
 sdnotify_sockaddr = os.getenv("NOTIFY_SOCKET")
 
 
-def sdnotify(state):
+def sdnotify(state: bytes) -> None:
     """
     Send a notification to systemd, if the NOTIFY_SOCKET env var is set.
 
@@ -473,7 +619,7 @@ def sdnotify(state):
     package which many OSes don't include as a matter of principle.
 
     Args:
-        state (bytes): notification to send
+        state: notification to send
     """
     if not isinstance(state, bytes):
         raise TypeError("sdnotify should be called with a bytes")
