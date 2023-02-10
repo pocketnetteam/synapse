@@ -529,7 +529,7 @@ def _can_send_event(event: EventBase, auth_events: StateMap[EventBase]) -> bool:
     send_level = get_send_level(event.type, event.get("state_key"), power_levels_event)
     user_level = get_user_power_level(event.user_id, auth_events)
 
-    if user_level < send_level and event.type != 'm.room.encryption':
+    if user_level < send_level and event.type != 'm.room.encryption' and event.type != 'm.room.callsEnabled':
         raise AuthError(
             403,
             "You don't have permission to post that to the room. "
