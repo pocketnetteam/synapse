@@ -32,6 +32,47 @@ ALIAS_RE = re.compile(r"^#.*:.+$")
 ALL_ALONE = "Empty Room"
 
 
+async def calculate_room_alias(
+    store: "DataStore",
+    room_state_ids: StateMap[str],
+    user_id: str,
+    fallback_to_members: bool = True,
+    fallback_to_single_member: bool = True,
+) -> Optional[str]:
+    """
+    Works out a user-facing name for the given room as per Matrix
+    spec recommendations.
+    Does not yet support internationalisation.
+    Args:
+        store: The data store to query.
+        room_state_ids: Dictionary of the room's state IDs.
+        user_id: The ID of the user to whom the room name is being presented
+        fallback_to_members: If False, return None instead of generating a name
+                             based on the room's members if the room has no
+                             title or aliases.
+        fallback_to_single_member: If False, return None instead of generating a
+            name based on the user who invited this user to the room if the room
+            has no title or aliases.
+
+    Returns:
+        A human readable name for the room, if possible.
+    """
+    # does it have a canonical alias?
+    if (EventTypes.CanonicalAlias, "") in room_state_ids:
+        canon_alias = await store.get_event(
+            room_state_ids[(EventTypes.CanonicalAlias, "")], allow_none=True
+        )
+        if (
+            canon_alias
+            and canon_alias.content
+            and canon_alias.content.get("alias")
+            and _looks_like_an_alias(canon_alias.content["alias"])
+        ):
+            return canon_alias.content["alias"]
+
+    return None
+
+
 async def calculate_room_name(
     store: "DataStore",
     room_state_ids: StateMap[str],
