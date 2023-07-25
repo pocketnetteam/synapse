@@ -11,12 +11,12 @@
 #    docker build -f docker/Dockerfile --build-arg PYTHON_VERSION=3.6 .
 #
 
-ARG PYTHON_VERSION=3.11
+ARG PYTHON_VERSION=3.8
 
 ###
 ### Stage 0: builder
 ###
-FROM docker.io/python:${PYTHON_VERSION}-slim as builder
+FROM docker.io/python:${PYTHON_VERSION}-slim-bullseye as builder
 
 # install the OS build deps
 RUN apt-get update && apt-get install -y \
