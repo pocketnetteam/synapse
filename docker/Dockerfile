@@ -11,7 +11,7 @@
 #    docker build -f docker/Dockerfile --build-arg PYTHON_VERSION=3.6 .
 #
 
-ARG PYTHON_VERSION=3.8
+ARG PYTHON_VERSION=3.11
 
 ###
 ### Stage 0: builder
