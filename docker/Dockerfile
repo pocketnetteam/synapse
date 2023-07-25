@@ -57,7 +57,7 @@ RUN pip install --prefix="/install" --no-deps --no-warn-script-location /synapse
 ### Stage 1: runtime
 ###
 
-FROM docker.io/python:${PYTHON_VERSION}-slim
+FROM python:3.8-slim-bullseye
 
 LABEL org.opencontainers.image.url='https://matrix.org/docs/projects/server/synapse'
 LABEL org.opencontainers.image.documentation='https://github.com/matrix-org/synapse/blob/master/docker/README.md'
