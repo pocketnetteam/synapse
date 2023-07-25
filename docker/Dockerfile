@@ -71,7 +71,7 @@ RUN apt-get update && apt-get install -y \
     gosu \
     libjpeg62-turbo \
     libpq5 \
-    libwebp7 \
+    libwebp6 \
     xmlsec1 \
     libjemalloc2 \
     libssl-dev \
