@@ -125,7 +125,7 @@ class Thumbnailer:
             if self.image.info.get("transparency", None) is not None:
                 mode = "RGBA"
             self.image = self.image.convert(mode)
-        return self.image.resize((width, height), Image.ANTIALIAS)
+        return self.image.resize((width, height), Image.LANCZOS)
 
     def scale(self, width: int, height: int, output_type: str) -> BytesIO:
         """Rescales the image to the given dimensions.
