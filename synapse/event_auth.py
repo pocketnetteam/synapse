@@ -450,7 +450,7 @@ def _is_membership_change_allowed(
         elif target_user_id != event.user_id:
             kick_level = get_named_level(auth_events, "kick", 50)
 
-            if user_level < kick_level or user_level <= target_level:
+            if user_level < kick_level or (user_level < 100 and user_level <= target_level):
                 raise AuthError(403, "You cannot kick user %s." % target_user_id)
     elif Membership.BAN == membership:
         if user_level < ban_level or user_level <= target_level:
